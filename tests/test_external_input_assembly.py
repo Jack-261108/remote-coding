@@ -100,7 +100,7 @@ class TestHookEventKindMap:
         ("event_name", "status", "expected"),
         [
             ("Stop", None, "stop"),
-            ("SubagentStop", None, "stop"),
+            ("SubagentStop", None, "SubagentStop"),
             ("StopFailure", None, "stop"),
             ("PostCompact", None, "turn_completed"),
             ("SessionEnd", None, "session_end"),

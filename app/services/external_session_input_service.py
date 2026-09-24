@@ -186,6 +186,7 @@ class ExternalSessionInputService:
         external_user_question_state: ExternalUserQuestionState | None = None,
         user_question_callback_registry: UserQuestionCallbackRegistry | None = None,
         drain_publish_wait_timeout_sec: float = 30.0,
+        in_flight_ttl_sec: float = 2.0,
         notify_user: _NotifyUserFn | None = None,
     ) -> None:
         self._enabled = enabled
@@ -201,8 +202,11 @@ class ExternalSessionInputService:
         self._external_uq_state = external_user_question_state
         self._uq_callback_registry = user_question_callback_registry
         self._drain_wait_timeout = drain_publish_wait_timeout_sec
+        self._in_flight_ttl_sec = in_flight_ttl_sec
         self._injecting: set[str] = set()
         self._in_flight: set[str] = set()
+        self._in_flight_generation: dict[str, int] = {}
+        self._in_flight_timers: dict[str, asyncio.Task[None]] = {}
         self._drain_slots: dict[str, _DrainSlot] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._shutting_down: bool = False
@@ -449,7 +453,7 @@ class ExternalSessionInputService:
             await self._mode_store.clear_target(user_id)
             dropped = await self._queue.clear(target.session_id)
             self._injecting.discard(target.session_id)
-            self._in_flight.discard(target.session_id)
+            self._clear_in_flight(target.session_id)
             await self._stop_drain(target.session_id)
         if dropped:
             await self._deliver_notices(
@@ -658,15 +662,21 @@ class ExternalSessionInputService:
             self._injecting.add(session_id)
             try:
                 outcome = await self._adapter.inject_text(ghostty_target.terminal_id, payload)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("ghostty inject raised", extra={"session_id": session_id})
-                self._injecting.discard(session_id)
                 return SendOutcome.INJECTION_FAILED
-            self._injecting.discard(session_id)
+            else:
+                if outcome == InjectionOutcome.OK:
+                    # Stay in _injecting until the guard timer is armed. Arming
+                    # waits on the lifecycle lock; a Stop scheduled during
+                    # AppleScript would otherwise clear the new guard and the
+                    # mismatched generation would then skip the timer.
+                    await self._mark_in_flight(session_id)
+            finally:
+                self._injecting.discard(session_id)
             if outcome == InjectionOutcome.OK:
-                # Mark in-flight only after AppleScript completed. A stale Stop
-                # arriving during injection is ignored by notify_hook_event.
-                self._in_flight.add(session_id)
                 return SendOutcome.SENT
             if outcome == InjectionOutcome.INDETERMINATE:
                 return SendOutcome.INJECTION_INDETERMINATE
@@ -703,7 +713,7 @@ class ExternalSessionInputService:
                 # A completion from an older turn can race with the AppleScript
                 # call for a new turn. It must not release the new turn's guard.
                 return
-            self._in_flight.discard(session_id)
+            self._clear_in_flight(session_id)
             await self._schedule_drain(session_id)
         elif kind in {"session_end", "sessionend", "sessionended", "clear"}:
             await self.invalidate_binding(session_id, reason="session_end")
@@ -720,7 +730,7 @@ class ExternalSessionInputService:
             dropped = await self._queue.clear(session_id)
             await self._pairing.invalidate_session(session_id)
             self._injecting.discard(session_id)
-            self._in_flight.discard(session_id)
+            self._clear_in_flight(session_id)
             await self._stop_drain(session_id)
             if self._external_uq_state is not None:
                 self._external_uq_state.invalidate_session(session_id)
@@ -759,7 +769,7 @@ class ExternalSessionInputService:
             await self._pairing.invalidate_binding(session_id, new_binding_id)
             await self._queue.clear(session_id)
             self._injecting.discard(session_id)
-            self._in_flight.discard(session_id)
+            self._clear_in_flight(session_id)
             await self._stop_drain(session_id)
             if self._external_uq_state is not None:
                 self._external_uq_state.invalidate_stale_bindings(session_id, new_binding_id)
@@ -1076,7 +1086,7 @@ class ExternalSessionInputService:
                 if current is not None and current.session_id == previous.session_id:
                     await self._notify_queue_cleared(previous.session_id, user_id=user_id, reason="已切换到其他输入会话")
                     self._injecting.discard(previous.session_id)
-                    self._in_flight.discard(previous.session_id)
+                    self._clear_in_flight(previous.session_id)
                     await self._stop_drain(previous.session_id)
         async with self._input_locks.lock(session_id):
             binding = self._binding_store.get_binding(session_id)
@@ -1102,6 +1112,66 @@ class ExternalSessionInputService:
         return self._probe.pid_controlling_tty(binding.pid)
 
     # --- drain task ----------------------------------------------------------
+
+    async def _mark_in_flight(self, session_id: str) -> None:
+        """Arm the post-inject guard and a single generation-scoped TTL timer.
+
+        A newer inject or an explicit clear bumps the generation so a timer
+        started for the previous guard cannot drop the current one. Expiry is
+        the only path that removes the id without a hook, and it always wakes
+        the drain.
+        """
+        generation = self._in_flight_generation.get(session_id, 0) + 1
+        self._in_flight_generation[session_id] = generation
+        self._in_flight.add(session_id)
+        try:
+            await self._schedule_in_flight_timeout(session_id, generation)
+        except asyncio.CancelledError:
+            # Text is already in the terminal. If arming was cancelled while
+            # waiting for the lifecycle lock, finish it; otherwise the guard
+            # has no timer and Stop was ignored for the whole inject.
+            if session_id not in self._in_flight_timers and self._in_flight_generation.get(session_id) == generation:
+                await self._schedule_in_flight_timeout(session_id, generation)
+            raise
+
+    def _clear_in_flight(self, session_id: str) -> None:
+        self._in_flight.discard(session_id)
+        self._in_flight_generation[session_id] = self._in_flight_generation.get(session_id, 0) + 1
+        self._cancel_in_flight_timer(session_id)
+
+    def _cancel_in_flight_timer(self, session_id: str) -> None:
+        task = self._in_flight_timers.pop(session_id, None)
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _schedule_in_flight_timeout(self, session_id: str, generation: int) -> None:
+        """Schedule an automatic release after the in-flight guard TTL expires."""
+        ttl = self._in_flight_ttl_sec
+
+        async def _release_after_ttl() -> None:
+            try:
+                await asyncio.sleep(ttl)
+            except asyncio.CancelledError:
+                raise
+            await self._release_in_flight_if_current(session_id, generation)
+
+        async with self._lifecycle_lock:
+            if self._shutting_down or self._in_flight_generation.get(session_id) != generation:
+                return
+            self._cancel_in_flight_timer(session_id)
+            task = asyncio.create_task(_release_after_ttl())
+            self._in_flight_timers[session_id] = task
+            self._pending_notices.add(task)
+            task.add_done_callback(self._pending_notices.discard)
+
+    async def _release_in_flight_if_current(self, session_id: str, generation: int) -> None:
+        if self._shutting_down or self._in_flight_generation.get(session_id) != generation:
+            return
+        self._in_flight.discard(session_id)
+        current = self._in_flight_timers.get(session_id)
+        if current is asyncio.current_task():
+            self._in_flight_timers.pop(session_id, None)
+        await self._schedule_drain(session_id)
 
     async def _schedule_drain(self, session_id: str) -> None:
         """Wake an existing drain loop so it re-checks phase + dequeues."""
@@ -1465,12 +1535,13 @@ class ExternalSessionInputService:
             self._injecting.add(session_id)
             try:
                 outcome = await self._adapter.inject_text(target.terminal_id, entry.text)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("ghostty drain inject raised", extra={"session_id": session_id})
+                # Drop the flag before the awaited cleanup. `return await` runs
+                # before `finally`, and a Stop during that await must not be ignored.
                 self._injecting.discard(session_id)
-                # Unknown adapter state: this entry cannot be retried safely, and
-                # the terminal may hold unsubmitted text — the untouched remainder
-                # stays queued until the session shows real activity.
                 return await self._drop_current_and_continue(
                     session_id,
                     user_id=user_id,
@@ -1478,9 +1549,13 @@ class ExternalSessionInputService:
                     detail="内部错误",
                     terminal_state_unknown=True,
                 )
-            self._injecting.discard(session_id)
+            else:
+                if outcome == InjectionOutcome.OK:
+                    # Same window as send_text: hold _injecting across arming.
+                    await self._mark_in_flight(session_id)
+            finally:
+                self._injecting.discard(session_id)
             if outcome == InjectionOutcome.OK:
-                self._in_flight.add(session_id)
                 return _DrainStep.INJECTED, notices
             if outcome in _RETRYABLE_PREFLIGHT_OUTCOMES:
                 # Preflight failure before anything was pasted (same set send_text

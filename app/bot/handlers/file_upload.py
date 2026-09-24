@@ -78,6 +78,10 @@ async def _download_telegram_file(message: Message, file_id: str) -> bytes | Non
         return bio.read()
     except Exception as exc:
         logger.exception("Failed to download file %s: %s", file_id, exc)
+        try:
+            await message.answer("❌ 下载失败: 从 Telegram 下载文件时发生异常。")
+        except Exception:
+            logger.warning("failed to report telegram download error", exc_info=True)
         return None
 
 

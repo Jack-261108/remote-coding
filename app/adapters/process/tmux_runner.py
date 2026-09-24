@@ -728,7 +728,7 @@ class TmuxRunner(TmuxSessionMixin, TmuxCommandMixin, TmuxLogMixin):
             ),
         )
         if meta.persistent_terminal:
-            await self._interrupt_session(meta.session_name)
+            await self._interrupt_locked(meta.session_name)
         else:
             await self._terminate_session(meta.session_name)
 
@@ -752,9 +752,14 @@ class TmuxRunner(TmuxSessionMixin, TmuxCommandMixin, TmuxLogMixin):
             ),
         )
         if meta.persistent_terminal:
-            await self._interrupt_session(meta.session_name)
+            await self._interrupt_locked(meta.session_name)
         else:
             await self._terminate_session(meta.session_name)
+
+    async def _interrupt_locked(self, session_name: str) -> bool:
+        """Serialize C-c with pane paste/select. Watch-loop cancel and idle timeout must use this too."""
+        async with self._pane_io_lock(session_name):
+            return await self._interrupt_session(session_name)
 
     def _drain_final_text(
         self,
@@ -884,7 +889,7 @@ class TmuxRunner(TmuxSessionMixin, TmuxCommandMixin, TmuxLogMixin):
         if queued:
             return True
         if persistent_terminal:
-            return await self._interrupt_session(session_name)
+            return await self._interrupt_locked(session_name)
         return await self._terminate_session(session_name)
 
     def get_session_state(self, terminal_key: str) -> SessionState | None:

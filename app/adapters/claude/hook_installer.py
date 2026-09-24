@@ -180,7 +180,7 @@ _STATUS_BY_EVENT = {{
     "PostCompact": "processing",
     "SubagentStart": "processing",
     "Stop": "waiting_for_input",
-    "SubagentStop": "waiting_for_input",
+    "SubagentStop": "processing",
     "StopFailure": "waiting_for_input",
     "SessionEnd": "ended",
 }}

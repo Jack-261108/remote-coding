@@ -18,7 +18,10 @@ from app.bot.presenters.structured_reply_presenter import (
     build_tool_status_message,
     build_tool_task_list_message,
 )
-from app.bot.presenters.telegram_formatting import TELEGRAM_TEXT_LIMIT, render_markdownish_to_telegram_html, split_telegram_html
+from app.bot.presenters.telegram_formatting import (
+    TELEGRAM_TEXT_LIMIT,
+    render_markdownish_with_html_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +90,8 @@ class ToolMessageManager:
             if existing is None:
                 return False, None
             try:
-                rendered = self._render(text)
-                await existing.message.edit_text(rendered, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                rendered, parse_mode = self._render(text)
+                await existing.message.edit_text(rendered, parse_mode=parse_mode, reply_markup=reply_markup)
                 return True, existing.message
             except Exception as exc:
                 if _is_message_not_modified(exc):
@@ -125,8 +128,8 @@ class ToolMessageManager:
 
     async def _send(self, text: str, *, tool_use_id: str) -> Message | None:
         try:
-            rendered = self._render(text)
-            return await self._root_message.answer(rendered, parse_mode=ParseMode.HTML)
+            rendered, parse_mode = self._render(text)
+            return await self._root_message.answer(rendered, parse_mode=parse_mode)
         except Exception:
             logger.exception(
                 "telegram tool message send failed",
@@ -141,8 +144,8 @@ class ToolMessageManager:
 
     async def _edit(self, message: Message, text: str, *, tool_use_id: str) -> bool:
         try:
-            rendered = self._render(text)
-            await message.edit_text(rendered, parse_mode=ParseMode.HTML, reply_markup=None)
+            rendered, parse_mode = self._render(text)
+            await message.edit_text(rendered, parse_mode=parse_mode, reply_markup=None)
             return True
         except Exception as exc:
             if _is_message_not_modified(exc):
@@ -158,9 +161,10 @@ class ToolMessageManager:
             )
             return False
 
-    def _render(self, text: str) -> str:
-        rendered = render_markdownish_to_telegram_html(text)
-        return split_telegram_html(rendered, TELEGRAM_TEXT_LIMIT)[0]
+    def _render(self, text: str) -> tuple[str, ParseMode | None]:
+        chunks, parse_mode_name = render_markdownish_with_html_fallback(text, TELEGRAM_TEXT_LIMIT)
+        parse_mode = ParseMode.HTML if parse_mode_name == "HTML" else None
+        return (chunks[0] if chunks else "", parse_mode)
 
 
 def _is_message_not_modified(exc: Exception) -> bool:

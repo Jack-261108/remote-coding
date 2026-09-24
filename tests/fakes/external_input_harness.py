@@ -56,6 +56,7 @@ def build_input_harness(
     probe: FakeLocalProcessProbe | None = None,
     queue_max_size: int = 5,
     drain_wait: float = 0.05,
+    in_flight_ttl: float = 2.0,
     monotonic: Callable[[], float] | None = None,
 ) -> InputHarness:
     """Assemble one harness under ``tmp_path / name``; caller picks a unique name."""
@@ -121,6 +122,7 @@ def build_input_harness(
         input_locks=locks,
         external_user_question_state=external_uq_state,
         drain_publish_wait_timeout_sec=drain_wait,
+        in_flight_ttl_sec=in_flight_ttl,
         notify_user=_notify_spy,
     )
     return InputHarness(

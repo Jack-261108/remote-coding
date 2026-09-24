@@ -82,7 +82,8 @@ class SessionStateCache:
             if user_id is not None:
                 state.user_id = user_id
             state.provider = provider
-            state.workdir = workdir
+            if workdir and workdir != ".":
+                state.workdir = workdir
             if terminal_id is not None:
                 state.terminal_id = terminal_id
             state.claude_session_id = resolved_claude_session_id or state.claude_session_id or state.session_id
@@ -94,7 +95,8 @@ class SessionStateCache:
             if user_id is not None:
                 state.user_id = user_id
             state.provider = provider
-            state.workdir = workdir
+            if workdir and workdir != ".":
+                state.workdir = workdir
             if terminal_id is not None:
                 state.terminal_id = terminal_id
             state.claude_session_id = resolved_claude_session_id or state.claude_session_id or state.session_id

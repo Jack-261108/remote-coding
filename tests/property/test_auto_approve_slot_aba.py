@@ -213,6 +213,18 @@ async def test_user_lock_cleanup_keeps_locked_idle_lock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_user_lock_cleanup_preserves_deny_epoch() -> None:
+    service = AutoApproveService()
+    await service.deactivate_all_for_user(1)
+    assert service.deny_epoch(1) == 1
+
+    await service.activate("session-1", user_id=1)
+    assert await service.deactivate_all_for_session("session-1") == 1
+
+    assert service.deny_epoch(1) == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_approve_public_mutators_wait_for_service_lock() -> None:
     service = AutoApproveService()
 

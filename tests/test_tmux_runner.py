@@ -2128,6 +2128,88 @@ async def test_watch_task_retries_empty_exit_file_before_finalize(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_cancel_waits_for_pane_io_lock_before_interrupt(tmp_path: Path) -> None:
+    runner = _runner_with_session_store(tmp_path)
+    session_name = "tgcli_user_1"
+    meta = _TmuxTaskMeta(
+        session_name=session_name,
+        log_file=runner._file_store.raw_transcript_path(session_name),
+        exit_file=tmp_path / "x-cancel.exit",
+        task_id="t-cancel-lock",
+        workdir=str(tmp_path),
+        terminal_id="user_1",
+        persistent_terminal=True,
+        interactive=True,
+        command_started_at=utc_now(),
+    )
+    runner._tasks["t-cancel-lock"] = meta
+
+    interrupt_calls: list[str] = []
+
+    async def fake_interrupt(name: str) -> bool:
+        interrupt_calls.append(name)
+        return True
+
+    runner._interrupt_session = fake_interrupt  # type: ignore[method-assign]
+
+    # 模拟外部正在持有 pane_io_lock 进行输入
+    async with runner._pane_io_lock(session_name):
+        cancel_task = asyncio.create_task(runner.cancel("t-cancel-lock"))
+        await asyncio.sleep(0.05)
+        # 在释放锁之前，interrupt 尚未被调用
+        assert interrupt_calls == []
+
+    await cancel_task
+    # 释放锁之后，interrupt 被顺利调用
+    assert interrupt_calls == [session_name]
+
+
+async def test_watch_interrupt_paths_wait_for_pane_io_lock(tmp_path: Path) -> None:
+    runner = _runner_with_session_store(tmp_path)
+    session_name = "tgcli_user_1"
+    now = utc_now()
+    meta = _TmuxTaskMeta(
+        session_name=session_name,
+        log_file=runner._file_store.raw_transcript_path(session_name),
+        exit_file=tmp_path / "x-watch-cancel.exit",
+        task_id="t-watch-cancel-lock",
+        workdir=str(tmp_path),
+        terminal_id="user_1",
+        persistent_terminal=True,
+        interactive=True,
+        command_started_at=now,
+    )
+    watch_state = _InteractiveWatchState(watch_started_at=now, completion_started_after=now)
+    interrupt_calls: list[str] = []
+
+    async def fake_interrupt(name: str) -> bool:
+        interrupt_calls.append(name)
+        return True
+
+    runner._interrupt_session = fake_interrupt  # type: ignore[method-assign]
+
+    async with runner._pane_io_lock(session_name):
+        cancel_task = asyncio.create_task(runner._handle_watch_cancel(meta=meta, started_at=0.0, now=1.0, position=0))
+        timeout_task = asyncio.create_task(
+            runner._handle_watch_timeout(
+                meta=meta,
+                timeout_sec=1,
+                started_at=0.0,
+                now=1.0,
+                timeout_started_at=0.0,
+                position=0,
+                watch_state=watch_state,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert interrupt_calls == []
+
+    await cancel_task
+    await timeout_task
+    assert interrupt_calls == [session_name, session_name]
+
+
+@pytest.mark.asyncio
 async def test_watch_task_invalid_exit_file_reports_unknown_exit_code_without_none(tmp_path: Path) -> None:
     runner = _runner_with_session_store(tmp_path, poll_interval_sec=0.01, exit_file_read_grace_sec=0)
     meta = _TmuxTaskMeta(

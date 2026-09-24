@@ -456,6 +456,78 @@ async def test_external_user_question_callback_still_uses_existing_handler(monke
     assert external_uq_state.get("tool-question") is None
 
 
+@pytest.mark.asyncio
+async def test_external_tmux_user_question_concurrent_callbacks_are_serialized_and_deduplicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inject_calls: list[int] = []
+
+    async def fake_inject(pane_id: str, *, option_index: int, submit_after: bool, tmux_bin: str = "tmux") -> tuple[bool, str]:
+        inject_calls.append(option_index)
+        await asyncio.sleep(0.05)
+        return True, ""
+
+    monkeypatch.setattr("app.adapters.process.pty_injector.inject_option_selection", fake_inject)
+
+    hook_socket_server = SimpleNamespace(respond_to_permission=AsyncMock(return_value=True))
+    external_uq_state = ExternalUserQuestionState()
+    registry = UserQuestionCallbackRegistry(ttl_sec=300)
+
+    prompt = UserQuestionPrompt(
+        tool_use_id="tool-concurrent",
+        question_index=0,
+        total_questions=1,
+        question="Choice",
+        header="H",
+        options=(UserQuestionOption(label="Opt0"), UserQuestionOption(label="Opt1")),
+        multi_select=False,
+    )
+    external_uq_state.store(
+        PendingExternalUserQuestion(
+            tool_use_id="tool-concurrent",
+            session_id="external-session",
+            user_id=1,
+            target=ExternalTmuxQuestionTarget(pane_id="%1"),
+            prompts=(prompt,),
+        )
+    )
+    tokens = await registry.register_question_tokens(
+        owner_user_id=1,
+        session_id="external-session",
+        tool_use_id="tool-concurrent",
+        question_index=0,
+        option_count=2,
+        multi_select=False,
+        origin=UserQuestionCallbackOrigin.EXTERNAL_TMUX,
+    )
+    token0 = tokens.select_tokens[0]
+    token1 = tokens.select_tokens[1]
+
+    router = DummyRouter()
+    register_external_permission_handler(
+        router,
+        hook_socket_server=hook_socket_server,
+        unbound_permission_handler=SimpleNamespace(),
+        permission_gateway=SimpleNamespace(handle_callback=AsyncMock()),
+        external_uq_state=external_uq_state,
+        user_question_callback_registry=registry,
+    )
+
+    cb0 = DummyCallbackQuery(f"ext_uq:{token0}", user_id=1, message=DummyMessage("Q"))
+    cb1 = DummyCallbackQuery(f"ext_uq:{token1}", user_id=1, message=DummyMessage("Q"))
+
+    await asyncio.gather(
+        _call_callback(router, 1, cb0),
+        _call_callback(router, 1, cb1),
+    )
+
+    assert len(inject_calls) == 1
+    answers = [cb0.answers[0][0], cb1.answers[0][0]]
+    assert any("Selected" in a for a in answers)
+    assert any("already answered" in a for a in answers)
+    hook_socket_server.respond_to_permission.assert_awaited_once()
+
+
 async def _store_multi_prompt_external_question(
     *,
     registry: UserQuestionCallbackRegistry,

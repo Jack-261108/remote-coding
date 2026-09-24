@@ -471,3 +471,17 @@ async def test_tool_message_manager_does_not_raise_when_send_fails() -> None:
     await manager.handle(_output(ToolStatus.RUNNING))
 
     assert root.sent == []
+
+
+@pytest.mark.asyncio
+async def test_tool_message_manager_falls_back_to_plain_text_on_oversized_tag() -> None:
+    root = DummyRootMessage()
+    manager = ToolMessageManager(root_message=root, task_id="task-1", user_id=1, provider="claude_code")
+
+    huge_url = "https://example.com/" + ("a" * 5000)
+    huge_text = f"查看文档: [link]({huge_url})"
+
+    text, parse_mode = manager._render(huge_text)
+    assert parse_mode is None
+    assert len(text) <= 4096
+    assert "https://example.com/" in text

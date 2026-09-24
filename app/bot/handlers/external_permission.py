@@ -10,6 +10,7 @@ from app.bot.handlers.callback_utils import apply_callback_response, safe_edit_k
 from app.bot.handlers.command_user_question import _is_accessible_message
 from app.bot.handlers.user_utils import extract_user_id
 from app.domain.user_question_models import ExternalTmuxQuestionTarget, UserQuestionPrompt
+from app.infra.lock_registry import RefCountedLockRegistry
 from app.infra.user_question_callbacks import (
     build_user_question_callback_data as build_opaque_callback_data,
 )
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     from app.services.unbound_permission_handler import UnboundPermissionHandler
 
 logger = logging.getLogger(__name__)
+
+_tmux_uq_locks = RefCountedLockRegistry(ttl_sec=300, cleanup_interval_sec=60, cleanup_batch_size=50)
 
 
 async def _build_next_prompt_keyboard(
@@ -150,47 +153,72 @@ def register_external_permission_handler(
             await callback.answer("Cannot inject: question is not a tmux target", show_alert=True)
             return
 
-        # Locate the prompt this button belongs to by the token's recorded
-        # question_index, not ``prompts[0]``. AskUserQuestion may carry multiple
-        # questions; an earlier bug hard-coded prompts[0] and treated the whole
-        # batch as final when ``len(prompts) == 1``, so N>1 prompts never
-        # submitted, never allowed the Hook, and dropped the pending record after
-        # a single non-submitting keystroke — leaving Claude blocked.
-        prompt = next((item for item in pending.prompts if item.question_index == snapshot.question_index), None)
-        if prompt is None:
-            await callback.answer("该问题已变化，请等待最新卡片", show_alert=True)
-            return
-        option_index = snapshot.option_index if snapshot.option_index is not None else -1
-        if option_index < 0 or option_index >= len(prompt.options):
-            await callback.answer("Invalid option", show_alert=True)
-            return
+        next_prompt: UserQuestionPrompt | None = None
+        pending_session_id = pending.session_id
+        async with _tmux_uq_locks.lock(target.pane_id):
+            fresh_resolved = await user_question_callback_registry.resolve(token, user_id=user_id)
+            if not isinstance(fresh_resolved, UserQuestionCallbackResolved):
+                await callback.answer("Question expired or already answered", show_alert=True)
+                return
 
-        selected_label = prompt.options[option_index].label
-        # The final question is the one at the highest question_index we still
-        # hold answers for, not the only element of a single-question batch.
-        is_final = snapshot.question_index == pending.prompts[-1].question_index
+            pending = external_uq_state.get(snapshot.tool_use_id)
+            if pending is None or pending.user_id != user_id:
+                await callback.answer("Question expired or already answered", show_alert=True)
+                return
 
-        ok, err = await inject_option_selection(
-            target.pane_id,
-            option_index=option_index,
-            submit_after=is_final,
-            tmux_bin=target.tmux_bin,
-        )
-        if not ok:
-            logger.warning(
-                "pty injection failed for external user question",
-                extra={"tool_use_id": snapshot.tool_use_id, "pane_id": target.pane_id, "error": err},
+            prompt = next((item for item in pending.prompts if item.question_index == snapshot.question_index), None)
+            if prompt is None:
+                await callback.answer("该问题已变化，请等待最新卡片", show_alert=True)
+                return
+            option_index = snapshot.option_index if snapshot.option_index is not None else -1
+            if option_index < 0 or option_index >= len(prompt.options):
+                await callback.answer("Invalid option", show_alert=True)
+                return
+
+            selected_label = prompt.options[option_index].label
+            is_final = snapshot.question_index == pending.prompts[-1].question_index
+            pending_session_id = pending.session_id
+
+            ok, err = await inject_option_selection(
+                target.pane_id,
+                option_index=option_index,
+                submit_after=is_final,
+                tmux_bin=target.tmux_bin,
             )
-            await callback.answer(f"Injection failed: {err}", show_alert=True)
-            return
+            if not ok:
+                logger.warning(
+                    "pty injection failed for external user question",
+                    extra={"tool_use_id": snapshot.tool_use_id, "pane_id": target.pane_id, "error": err},
+                )
+                await callback.answer(f"Injection failed: {err}", show_alert=True)
+                return
 
-        await callback.answer(f"✅ Selected: {selected_label}")
+            # Drop tokens before releasing the pane lock. Telegram I/O can raise
+            # (expired callback query); a waiter must not inject a second time.
+            if is_final:
+                external_uq_state.remove(snapshot.tool_use_id)
+                await user_question_callback_registry.invalidate_tool(
+                    session_id=pending_session_id,
+                    tool_use_id=snapshot.tool_use_id,
+                )
+            else:
+                await user_question_callback_registry.invalidate_prompt(
+                    session_id=pending_session_id,
+                    tool_use_id=snapshot.tool_use_id,
+                    question_index=snapshot.question_index,
+                )
+                next_prompt = next(
+                    (item for item in pending.prompts if item.question_index > snapshot.question_index),
+                    None,
+                )
+
+        try:
+            await callback.answer(f"✅ Selected: {selected_label}")
+        except Exception:
+            logger.warning("failed to answer external user question callback", exc_info=True)
 
         callback_message = callback.message if _is_accessible_message(callback.message) else None
-
         if callback_message is not None:
-            # Clear this card's buttons so the user can't re-fire a stale option
-            # while the terminal is mid-transition.
             await safe_edit_keyboard(callback_message, None, "clear ext_uq inline keyboard")
             original_text = callback_message.text or ""
             try:
@@ -204,7 +232,6 @@ def register_external_permission_handler(
                 decision="allow",
                 reason=f"AskUserQuestion answered via Telegram by user {user_id}",
             )
-            external_uq_state.remove(snapshot.tool_use_id)
             logger.info(
                 "external user question answered via Telegram",
                 extra={
@@ -218,15 +245,6 @@ def register_external_permission_handler(
             )
             return
 
-        # Intermediate question: Claude's TUI has advanced past this prompt after
-        # the keystroke, but the Hook permission is still held; we must NOT allow
-        # it and must NOT remove the pending record — the remaining prompts still
-        # need it. Push a fresh card with buttons for the next prompt so the user
-        # can keep answering without touching the terminal.
-        next_prompt = next(
-            (item for item in pending.prompts if item.question_index > snapshot.question_index),
-            None,
-        )
         logger.info(
             "external user question advanced to next prompt",
             extra={
@@ -240,12 +258,10 @@ def register_external_permission_handler(
         if next_prompt is not None and callback_message is not None:
             keyboard = await _build_next_prompt_keyboard(
                 user_id=user_id,
-                pending_session_id=pending.session_id,
+                pending_session_id=pending_session_id,
                 prompt=next_prompt,
                 registry=user_question_callback_registry,
             )
-            # Match the initial card's ❓/{sid}/问题/选项 layout (not a bare
-            # question string) so the follow-up card is visually consistent.
-            body = format_external_tmux_question_text(next_prompt, pending.session_id)
+            body = format_external_tmux_question_text(next_prompt, pending_session_id)
             text = f"{body}\n\n👇 点击按钮选择；可直接回复文字作为 Other/自由文本"
             await callback_message.answer(text, reply_markup=keyboard)

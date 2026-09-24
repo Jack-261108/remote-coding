@@ -54,6 +54,7 @@ async def make_harness(tmp_path: Path):
         probe: FakeLocalProcessProbe | None = None,
         queue_max_size: int = 5,
         drain_wait: float = 0.05,
+        in_flight_ttl: float = 2.0,
         monotonic: Callable[[], float] | None = None,
     ) -> InputHarness:
         nonlocal counter
@@ -70,6 +71,7 @@ async def make_harness(tmp_path: Path):
             probe=probe,
             queue_max_size=queue_max_size,
             drain_wait=drain_wait,
+            in_flight_ttl=in_flight_ttl,
             monotonic=monotonic,
         )
         services.append(harness.service)
@@ -1297,3 +1299,129 @@ async def test_validate_foreground_offloads_to_worker_thread(make_harness, monke
     assert args == ()
     assert kwargs == {"pid": 1234, "paired_tty": "/dev/ttys005"}
     assert harness.probe.validation_calls[-1] == (1234, "/dev/ttys005")
+
+
+async def test_in_flight_timeout_prevents_drain_deadlock_when_no_further_stop_arrives(make_harness) -> None:
+    adapter = FakeGhosttyTerminalAdapter()
+    adapter.inject_entered = asyncio.Event()
+    adapter.inject_release = asyncio.Event()
+    # 使用极短的 in_flight_ttl (0.05s) 测试自动超时解除
+    # drain_wait 必须远大于 TTL：超时任务自己要叫醒 drain，不能靠 publish 超时重试。
+    harness = make_harness(adapter=adapter, drain_wait=30, in_flight_ttl=0.05)
+    await _activate(harness)
+
+    first_task = asyncio.create_task(harness.service.send_text(user_id=42, text="first"))
+    await asyncio.wait_for(adapter.inject_entered.wait(), timeout=1)
+    # 在注入期间到达 Stop 事件（被 _injecting 分支忽略）
+    await harness.service.notify_hook_event(session_id="session-1", event_kind="Stop")
+    adapter.inject_release.set()
+    assert await first_task is SendOutcome.SENT
+
+    adapter.inject_entered = None
+    adapter.inject_release = None
+
+    # 第二条消息入队，进入 in-flight 排队保护
+    assert await harness.service.send_text(user_id=42, text="second") is SendOutcome.QUEUED
+    assert adapter.inject_calls == [("term-1", "first")]
+
+    # 注意：此时没有任何后续的 Hook Stop 事件到达！
+    # 旧实现会永久死锁在这个状态；新实现经过 in_flight_ttl 超时自动释放并成功 drain 注入！
+    await _wait_until(lambda: len(adapter.inject_calls) == 2, timeout=1.0)
+    assert adapter.inject_calls[-1] == ("term-1", "second")
+
+
+async def test_stale_in_flight_timer_does_not_clear_newer_guard(make_harness) -> None:
+    harness = make_harness(in_flight_ttl=30, drain_wait=30)
+    await _activate(harness)
+    service = harness.service
+
+    await service._mark_in_flight("session-1")
+    stale_generation = service._in_flight_generation["session-1"]
+    await service._mark_in_flight("session-1")
+    await service._release_in_flight_if_current("session-1", stale_generation)
+
+    assert "session-1" in service._in_flight
+    assert await service.send_text(user_id=42, text="queued") is SendOutcome.QUEUED
+
+
+async def test_in_flight_timeout_cancellation_propagates(make_harness) -> None:
+    harness = make_harness(in_flight_ttl=30)
+    await _activate(harness)
+    service = harness.service
+    await service._mark_in_flight("session-1")
+    task = service._in_flight_timers["session-1"]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "session-1" in service._in_flight
+
+
+async def test_stop_while_arming_in_flight_does_not_drop_guard(make_harness) -> None:
+    """A Stop that becomes runnable only while arming waits on the lifecycle lock
+    is the same stale completion `_injecting` exists to ignore."""
+    harness = make_harness(in_flight_ttl=30, drain_wait=30)
+    await _activate(harness)
+    service = harness.service
+
+    await service._lifecycle_lock.acquire()
+    send_task = asyncio.create_task(service.send_text(user_id=42, text="first"))
+    try:
+        await _wait_until(
+            lambda: "session-1" in service._in_flight and "session-1" not in service._in_flight_timers,
+        )
+        await service.notify_hook_event(session_id="session-1", event_kind="Stop")
+        assert "session-1" in service._in_flight
+    finally:
+        service._lifecycle_lock.release()
+
+    assert await send_task is SendOutcome.SENT
+    assert "session-1" in service._in_flight
+    assert "session-1" in service._in_flight_timers
+    assert await service.send_text(user_id=42, text="second") is SendOutcome.QUEUED
+
+
+async def test_cancel_during_in_flight_arming_still_arms_timer(make_harness) -> None:
+    harness = make_harness(in_flight_ttl=30, drain_wait=30)
+    await _activate(harness)
+    service = harness.service
+
+    await service._lifecycle_lock.acquire()
+    send_task = asyncio.create_task(service.send_text(user_id=42, text="first"))
+    try:
+        await _wait_until(
+            lambda: "session-1" in service._in_flight and "session-1" not in service._in_flight_timers,
+        )
+        send_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        service._lifecycle_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await send_task
+
+    assert "session-1" not in service._injecting
+    assert "session-1" in service._in_flight
+    assert "session-1" in service._in_flight_timers
+
+
+async def test_send_text_cancellation_cleans_up_injecting_flag(make_harness) -> None:
+    adapter = FakeGhosttyTerminalAdapter()
+    adapter.inject_entered = asyncio.Event()
+    adapter.inject_release = asyncio.Event()
+    harness = make_harness(adapter=adapter)
+    await _activate(harness)
+
+    task = asyncio.create_task(harness.service.send_text(user_id=42, text="cancelled"))
+    await asyncio.wait_for(adapter.inject_entered.wait(), timeout=1)
+    assert "session-1" in harness.service._injecting
+
+    # 取消正在注入的任务
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # 验证 _injecting 已被清理，不会永久残留屏蔽后续 Hook 事件
+    assert "session-1" not in harness.service._injecting
+    adapter.inject_release.set()

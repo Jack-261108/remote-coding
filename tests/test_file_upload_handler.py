@@ -438,3 +438,18 @@ async def test_download_failure_replies_with_error() -> None:
     reply = message.answer.call_args[0][0]
     assert "❌" in reply
     assert "Network timeout" in reply
+
+
+@pytest.mark.asyncio
+async def test_download_telegram_file_sends_error_on_exception() -> None:
+    from app.bot.handlers.file_upload import _download_telegram_file
+
+    message = _make_message()
+    bot = AsyncMock()
+    message.bot = bot
+    bot.get_file = AsyncMock(side_effect=RuntimeError("connection dropped"))
+
+    result = await _download_telegram_file(message, "file123")
+    assert result is None
+    message.answer.assert_awaited_once()
+    assert "下载失败" in message.answer.call_args[0][0]

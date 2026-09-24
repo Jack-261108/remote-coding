@@ -147,6 +147,86 @@ async def test_session_supervisor_subagent_sync_exception_keeps_watcher_running(
 
 
 @pytest.mark.asyncio
+async def test_session_supervisor_subagent_sync_retries_when_mtime_unchanged(
+    tmp_path: Path,
+) -> None:
+    subagent_file = tmp_path / "agent.jsonl"
+    subagent_file.write_text("first", encoding="utf-8")
+    state = SessionState(session_id="claude-session-1", workdir=str(tmp_path))
+    state.tool_calls["task-1"] = ToolCallRecord(
+        tool_use_id="task-1",
+        name="Task",
+        structured_result={"agentId": "agent-1"},
+    )
+    sync_calls = 0
+    second_sync = asyncio.Event()
+
+    async def on_jsonl_sync(session_id: str, cwd: str) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise RuntimeError("sync failed")
+        second_sync.set()
+
+    supervisor = SessionSupervisor(
+        session_store=_FakeStore(state),
+        claude_jsonl_parser=_FakeParser(subagent_file=subagent_file),
+        on_jsonl_sync=on_jsonl_sync,
+        on_dispatch_event=lambda event: asyncio.sleep(0),
+        poll_interval_sec=0.01,
+        debounce_sec=0.01,
+    )
+
+    supervisor.watch(session_id=state.session_id, workdir=state.workdir)
+    try:
+        await asyncio.wait_for(second_sync.wait(), timeout=1)
+    finally:
+        await supervisor.stop_all()
+
+    assert sync_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_session_supervisor_subagent_sync_runs_outside_watcher_lock(tmp_path: Path) -> None:
+    subagent_file = tmp_path / "agent.jsonl"
+    subagent_file.write_text("initial", encoding="utf-8")
+    state = SessionState(session_id="claude-session-1", workdir=str(tmp_path))
+    state.tool_calls["task-1"] = ToolCallRecord(
+        tool_use_id="task-1",
+        name="Task",
+        structured_result={"agentId": "agent-1"},
+    )
+    synced = asyncio.Event()
+    was_locked_during_sync: bool | None = None
+
+    supervisor: SessionSupervisor | None = None
+
+    async def on_jsonl_sync(session_id: str, cwd: str) -> None:
+        nonlocal was_locked_during_sync
+        assert supervisor is not None
+        lock = supervisor._locks.get(session_id)
+        was_locked_during_sync = lock.locked() if lock is not None else False
+        synced.set()
+
+    supervisor = SessionSupervisor(
+        session_store=_FakeStore(state),
+        claude_jsonl_parser=_FakeParser(subagent_file=subagent_file),
+        on_jsonl_sync=on_jsonl_sync,
+        on_dispatch_event=lambda event: asyncio.sleep(0),
+        poll_interval_sec=0.01,
+        debounce_sec=0.01,
+    )
+
+    supervisor.watch(session_id=state.session_id, workdir=state.workdir)
+    try:
+        await asyncio.wait_for(synced.wait(), timeout=1)
+    finally:
+        await supervisor.stop_all()
+
+    assert was_locked_during_sync is False
+
+
+@pytest.mark.asyncio
 async def test_session_supervisor_done_callback_restarts_crashed_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
     state = SessionState(session_id="claude-session-1", workdir="/tmp")
     supervisor = SessionSupervisor(

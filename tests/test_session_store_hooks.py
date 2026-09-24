@@ -894,3 +894,65 @@ def test_session_store_file_synced_accepts_smaller_offset_when_snapshot_has_more
     assert state.last_reply == "第二条"
     assert state.checkpoint.last_offset == 18
     assert [turn.turn_id for turn in state.turns] == ["a-current", "a-next"]
+
+
+def test_subagent_stop_preserves_parent_pending_permission(tmp_path) -> None:
+    store = SessionStore(FileSessionStore(str(tmp_path)))
+    store.get_or_create(session_id="s1", workdir="/tmp/project")
+
+    store.process(
+        SessionEvent(
+            session_id="s1",
+            type=SessionEventType.HOOK_RECEIVED,
+            payload={
+                "session_id": "s1",
+                "cwd": "/tmp/project",
+                "event": "PreToolUse",
+                "status": "running_tool",
+                "tool": "Task",
+                "tool_input": {"description": "sub task"},
+                "tool_use_id": "task-1",
+            },
+        )
+    )
+
+    store.process(
+        SessionEvent(
+            session_id="s1",
+            type=SessionEventType.HOOK_RECEIVED,
+            payload={
+                "session_id": "s1",
+                "cwd": "/tmp/project",
+                "event": "PermissionRequest",
+                "status": "waiting_for_approval",
+                "tool": "Bash",
+                "tool_input": {"command": "rm -rf tmp"},
+                "tool_use_id": "bash-1",
+            },
+        )
+    )
+
+    state = store.get("s1")
+    assert state is not None
+    assert state.phase == SessionPhase.WAITING_FOR_APPROVAL
+    assert state.pending_permission is not None
+    assert state.pending_permission.tool_use_id == "bash-1"
+
+    state = store.process(
+        SessionEvent(
+            session_id="s1",
+            type=SessionEventType.HOOK_RECEIVED,
+            payload={
+                "session_id": "s1",
+                "cwd": "/tmp/project",
+                "event": "SubagentStop",
+                "status": "processing",
+            },
+        )
+    )
+
+    assert state.phase == SessionPhase.WAITING_FOR_APPROVAL
+    assert state.pending_permission is not None
+    assert state.pending_permission.tool_use_id == "bash-1"
+    assert state.tool_calls["bash-1"].status == ToolStatus.WAITING_FOR_APPROVAL
+    assert state.interrupted is False

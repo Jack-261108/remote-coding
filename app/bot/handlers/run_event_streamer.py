@@ -235,14 +235,16 @@ class RunEventStreamer:
         except asyncio.CancelledError:
             raise
 
-    async def _drain_available_structured_replies(self, *, max_iterations: int = 10) -> None:
+    async def _drain_available_structured_replies(self, *, max_iterations: int = 10, wait_timeout_sec: float = 0.0) -> None:
+        timeout = wait_timeout_sec
         for _ in range(max_iterations):
-            changed = await self._presenter.wait_for_initial_update(timeout_sec=0)
+            changed = await self._presenter.wait_for_initial_update(timeout_sec=timeout)
             if not changed:
                 return
             async with self._emit_lock:
                 await self._dispatcher.emit_presenter_messages(log_missing=False)
             await self._dispatcher.flush()
+            timeout = 0.0
 
     async def _emit_delayed_structured_reply(self) -> None:
         if self._presenter.has_emitted_structured_reply or not self._presenter.has_announced_fallback:
@@ -491,6 +493,11 @@ class RunEventStreamer:
                         await self._dispatcher.emit_presenter_messages(final=True, log_missing=True)
                     await self._dispatcher.flush()
                     await self._emit_delayed_structured_reply()
+                    # 在最终冻结游标前，给进程退出瞬间落盘的最后回复留出排空机会，避免回复被过早冻结丢弃
+                    await self._drain_available_structured_replies(wait_timeout_sec=0.1)
+                    async with self._emit_lock:
+                        await self._dispatcher.emit_presenter_messages(final=True, log_missing=False)
+                    await self._dispatcher.flush()
                     self._presenter.freeze_reply_cursor()
             finally:
                 if self._status_display and self._lifecycle_message:

@@ -1496,3 +1496,61 @@ async def test_hook_socket_server_rejects_permission_when_pending_limit_reached(
         await server.stop()
 
     assert seen == ["tool-1"]
+
+
+@pytest.mark.asyncio
+async def test_hook_socket_server_stop_with_pending_permission_closes_writer_before_wait_closed(tmp_path) -> None:
+    socket_path = _socket_path()
+    server = HookSocketServer(str(socket_path))
+    delivered = asyncio.Event()
+
+    async def on_event(event: HookEvent) -> None:
+        delivered.set()
+
+    await server.start(on_event)
+    reader, writer = await _send_event(
+        socket_path,
+        {
+            "session_id": "s1",
+            "cwd": "/tmp/project",
+            "event": "PermissionRequest",
+            "status": "waiting_for_approval",
+            "tool": "Bash",
+            "tool_input": {"command": "pwd"},
+            "tool_use_id": "tool-1",
+        },
+    )
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+    assert await server.get_pending_permission(session_id="s1") is not None
+
+    raw_server = server._server
+    assert raw_server is not None
+    original_wait_closed = raw_server.wait_closed
+    wait_closed_called = False
+    pending_writers_closed_at_wait_closed = False
+
+    # 捕获 pending permission 的 writer 引用
+    pending_entry = server._pending_permissions.get("tool-1")
+    assert pending_entry is not None
+    target_writer = pending_entry.writer
+
+    async def check_wait_closed() -> None:
+        nonlocal wait_closed_called, pending_writers_closed_at_wait_closed
+        wait_closed_called = True
+        # 在 Python 3.12+ 语意中，如果 pending writer 尚未关闭，wait_closed 会死锁。
+        # 验证此时 target_writer 已经处于 closing / closed 状态，且 server 内部 pending 已清空
+        if target_writer.is_closing() and len(server._pending_permissions) == 0:
+            pending_writers_closed_at_wait_closed = True
+        await original_wait_closed()
+
+    raw_server.wait_closed = check_wait_closed  # type: ignore[method-assign]
+
+    # stop() 应当快速完成且不超时挂起
+    await asyncio.wait_for(server.stop(), timeout=2)
+
+    assert wait_closed_called is True
+    assert pending_writers_closed_at_wait_closed is True
+    # 客户端连接应当已被服务端断开（收到 EOF）
+    assert await asyncio.wait_for(reader.read(), timeout=1) == b""
+    writer.close()
+    await writer.wait_closed()

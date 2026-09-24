@@ -342,7 +342,6 @@ class AutoApproveService:
         if any(slot.holder_user_id == user_id for slot in self._slots.values()):
             return
         self._user_locks.pop(user_id, None)
-        self._deny_epoch.pop(user_id, None)
 
     def _log_slot_commit_mismatch(self, *, session_id: str, user_id: int, attempt_id: str, slot: ActivationSlot | None) -> None:
         logger.warning(

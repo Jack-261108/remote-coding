@@ -213,7 +213,13 @@ class SessionEventProcessor:
         elif is_session_end:
             state.interrupted = self._interrupt_session_tools(state, event.at) or previous_interrupted
             state.phase = SessionPhase.ENDED
-        elif hook.event in {"Stop", "SubagentStop"} or hook.status == "waiting_for_input":
+        elif hook.event == "SubagentStop":
+            if state.subagent_state.has_active_subagent:
+                current_task = state.subagent_state.current_task()
+                if current_task is not None:
+                    state.subagent_state.stop_task(task_tool_id=current_task.task_tool_id)
+            self._move_to_next_phase(state, default=SessionPhase.PROCESSING)
+        elif hook.event == "Stop" or hook.status == "waiting_for_input":
             state.interrupted = self._interrupt_session_tools(state, event.at)
             state.phase = SessionPhase.WAITING_FOR_INPUT
         elif hook.status in {"running_tool", "processing", "starting"}:

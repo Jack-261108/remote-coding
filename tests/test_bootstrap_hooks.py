@@ -2054,6 +2054,10 @@ async def test_session_end_cleans_event_lock_registry(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_terminal_permission_resolution_edits_telegram_message_once(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     container = AppContainer(make_settings(tmp_path, install_hooks=False))
+    # 初始化会话状态并绑定有效工作目录
+    initial_workdir = str(tmp_path / "my_project")
+    container.structured_session_store.get_or_create(session_id="claude-session-1", workdir=initial_workdir)
+
     token = await container.permission_callback_registry.register_token(
         tool_use_id="tool-1",
         session_id="claude-session-1",
@@ -2081,6 +2085,10 @@ async def test_terminal_permission_resolution_edits_telegram_message_once(tmp_pa
     assert "已在终端批准" in kwargs["text"]
     assert "请点击下方按钮选择允许或拒绝。" not in kwargs["text"]
     assert kwargs["parse_mode"] == "HTML"
+    # 验证缺少 cwd 的权限事件没有将真实 workdir 覆写为 "."
+    session_state = container.structured_session_store.get("claude-session-1")
+    assert session_state is not None
+    assert session_state.workdir == initial_workdir
 
 
 @pytest.mark.asyncio

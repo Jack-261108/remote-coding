@@ -128,17 +128,18 @@ class HookSocketServer:
         self._stopping = True
         server = self._server
         self._server = None
-        # 先取消并等待 client handlers 结束，再关闭监听 server。Python 3.12+
-        # 的 Server.wait_closed() 会等待活跃连接 handler 退出；若 handler 卡在
-        # paused ingress 或等待 EOF 读上，先 close 会让 stop() 永久阻塞。
+        if server is not None:
+            server.close()
+        # 先取消并等待 client handlers 结束。Python 3.12+ 的 Server.wait_closed()
+        # 会等待活跃连接退出；若 handler 卡在 paused ingress 或等待 EOF 读上，需先取消。
         client_tasks = list(self._client_tasks)
         for task in client_tasks:
             task.cancel()
         await asyncio.gather(*client_tasks, return_exceptions=True)
         self._client_tasks.clear()
-        if server is not None:
-            server.close()
-            await server.wait_closed()
+        # 取消 pending permissions 相关的定时/断线任务，并在 wait_closed 之前关闭 writer。
+        # 在 Python 3.12+ 中，wait_closed() 会等待所有连接断开；keep-open 的权限连接若在
+        # wait_closed 之后才关闭，会导致停机死锁。
         async with self._lock:
             pending = list(self._pending_permissions.values())
             expiration_tasks = list(self._pending_expiration_tasks.values())
@@ -156,6 +157,8 @@ class HookSocketServer:
             with suppress(asyncio.CancelledError):
                 await task
         await self._close_pending_permissions(pending, emit_failure=False)
+        if server is not None:
+            await server.wait_closed()
         with suppress(FileNotFoundError):
             self._socket_path.unlink()
 

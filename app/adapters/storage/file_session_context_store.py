@@ -48,9 +48,10 @@ class FileSessionContextStore:
 
     async def list_all(self) -> list[SessionContext]:
         async with self._lock:
-            if self._list_cache is not None:
-                return list(self._list_cache)
-            return list(await self._reload_cache_locked())
+            cache = self._list_cache
+            if cache is None:
+                cache = await self._reload_cache_locked()
+            return [copy.deepcopy(ctx) for ctx in cache]
 
     async def get_by_claude_session_id(self, claude_session_id: str) -> SessionContext | None:
         """O(1) index lookup by claude_session_id. Returns None on miss.
@@ -62,7 +63,8 @@ class FileSessionContextStore:
             if not self._index_loaded:
                 # Cold start: load from disk to populate index
                 await self._reload_cache_locked()
-            return self._claude_session_index.get(claude_session_id)
+            ctx = self._claude_session_index.get(claude_session_id)
+            return copy.deepcopy(ctx) if ctx is not None else None
 
     async def save(self, session: SessionContext) -> None:
         async with self._lock:
@@ -74,22 +76,25 @@ class FileSessionContextStore:
             # Persist
             self._file_store.save_session_context(session)
 
+            # Store an isolated copy in cache to protect against subsequent caller mutations
+            cached = copy.deepcopy(session)
+
             # Update cache if it exists (avoid invalidating the entire cache)
             if self._list_cache is not None:
                 # Find and replace the session in the cache
                 for i, ctx in enumerate(self._list_cache):
                     if ctx.user_id == session.user_id:
-                        self._list_cache[i] = session
+                        self._list_cache[i] = cached
                         break
                 else:
                     # Session not in cache, add it
-                    self._list_cache.append(session)
+                    self._list_cache.append(cached)
 
             self._index_loaded = True  # Index is being maintained
 
             # Update index (last-writer-wins when two contexts share the same id)
-            if session.claude_session_id:
-                self._claude_session_index[session.claude_session_id] = session
+            if cached.claude_session_id:
+                self._claude_session_index[cached.claude_session_id] = cached
 
     async def delete(self, user_id: int) -> bool:
         async with self._lock:

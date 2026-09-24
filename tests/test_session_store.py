@@ -56,6 +56,31 @@ async def test_context_store_get_loads_disk_once_then_serves_memory(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_context_store_list_all_and_index_return_isolated_copies(tmp_path) -> None:
+    file_store = FileSessionStore(str(tmp_path))
+    file_store.save_session_context(
+        SessionContext(user_id=42, session_id="s1", provider="claude_code", workdir="/project", claude_session_id="c1")
+    )
+    store = FileSessionContextStore(file_store)
+
+    listed = await store.list_all()
+    assert len(listed) == 1
+    indexed = await store.get_by_claude_session_id("c1")
+    assert indexed is not None
+
+    # 验证 list_all 与 index 拿到的是隔离的对象，就地修改不污染缓存
+    listed[0].attached_user_ids.append(999)
+    indexed.claude_session_id = "mutated"
+
+    fresh_listed = await store.list_all()
+    assert fresh_listed[0].attached_user_ids == []
+
+    fresh_indexed = await store.get_by_claude_session_id("c1")
+    assert fresh_indexed is not None
+    assert fresh_indexed.claude_session_id == "c1"
+
+
+@pytest.mark.asyncio
 async def test_context_store_get_tolerates_corrupt_context_file(tmp_path) -> None:
     """The cache is built via a directory scan, so a corrupt file must degrade
     to absent for its own user only — same contract as load_session_context."""
@@ -949,3 +974,18 @@ async def test_session_service_clear_terminal_group_resets_owner_and_attached_co
     assert await service.lookup_by_claude_session_id("claude-owner") is None
     assert await service.lookup_by_claude_session_id("claude-attached") is None
     assert await service.lookup_by_claude_session_id("claude-other") is not None
+
+
+def test_session_store_get_or_create_does_not_clobber_valid_workdir_with_default_dot(tmp_path) -> None:
+    store = SessionStore(FileSessionStore(str(tmp_path)))
+    state = store.get_or_create(session_id="claude-session-1", workdir="/tmp/project")
+    assert state.workdir == "/tmp/project"
+
+    # 调用 get_or_create 传入缺省 "." 时，绝不能冲掉已有的真实目录
+    updated = store.get_or_create(session_id="claude-session-1", workdir=".")
+    assert updated.workdir == "/tmp/project"
+
+    # 重新从磁盘加载 hydrates 时，也不被缺省 "." 冲掉
+    reloaded = SessionStore(FileSessionStore(str(tmp_path)))
+    state_reloaded = reloaded.get_or_create(session_id="claude-session-1", workdir=".")
+    assert state_reloaded.workdir == "/tmp/project"

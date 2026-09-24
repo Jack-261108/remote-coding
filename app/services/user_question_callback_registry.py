@@ -265,6 +265,11 @@ class UserQuestionCallbackRegistry(BaseCallbackRegistry[UserQuestionCallbackReco
                 return UserQuestionCallbackUnauthorized()
             return UserQuestionCallbackResolved(UserQuestionCallbackSnapshot.from_record(record))
 
+    async def invalidate_prompt(self, *, session_id: str, tool_use_id: str, question_index: int) -> int:
+        return await self._invalidate_matching(
+            lambda record: record.session_id == session_id and record.tool_use_id == tool_use_id and record.question_index == question_index
+        )
+
     async def invalidate_tool(self, *, session_id: str, tool_use_id: str) -> int:
         return await self._invalidate_matching(lambda record: record.session_id == session_id and record.tool_use_id == tool_use_id)
 

@@ -41,11 +41,11 @@ from app.services.user_question_callback_registry import UserQuestionCallbackOri
 logger = logging.getLogger(__name__)
 
 
-# Hook events that signal the same "turn ended / back to sendable phase" as ``Stop``: a subagent
-# turn ends, stop failed mid-flush, or compaction finished. ``notify_hook_event`` normalises only
-# with ``.lower().replace("-","_")`` (no CamelCase→snake_case), so raw ``SubagentStop`` /
+# Hook events that signal the same "turn ended / back to sendable phase" as ``Stop``:
+# stop failed mid-flush, or compaction finished. ``notify_hook_event`` normalises only
+# with ``.lower().replace("-","_")`` (no CamelCase→snake_case), so raw
 # ``StopFailure`` / ``PostCompact`` would miss its ``stop`` branch — translate them here.
-_HOOK_STOP_EQUIVALENTS = frozenset({"Stop", "SubagentStop", "StopFailure"})
+_HOOK_STOP_EQUIVALENTS = frozenset({"Stop", "StopFailure"})
 
 
 def _map_hook_event_kind(event: HookEvent) -> str | None:
@@ -1635,11 +1635,14 @@ class EventDispatchMixin(AppContainerBase):
     async def _dispatch_session_event(self, event: SessionEvent) -> None:
         is_session_end = self._is_session_end_dispatch_event(event)
         payload = event.payload_dict()
+        cwd = payload.get("cwd")
         async with self._session_event_locks.lock(event.session_id):
+            existing = self.structured_session_store.get(event.session_id)
+            workdir = str(cwd) if cwd else (existing.workdir if existing and existing.workdir else ".")
             self.structured_session_store.get_or_create(
                 session_id=event.session_id,
                 provider="claude_code",
-                workdir=str(payload.get("cwd", ".")),
+                workdir=workdir,
                 claude_session_id=event.session_id,
             )
             self.structured_session_store.process(event)

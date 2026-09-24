@@ -181,6 +181,7 @@ class SessionSupervisor:
             while self._active:
                 active_state = True
                 main_jsonl_signature: _MainJSONLSignature | None = None
+                subagent_files_changed = False
                 try:
                     async with lock:
                         state = self._session_store.get(session_id)
@@ -197,15 +198,20 @@ class SessionSupervisor:
                         # Agent file sync (any phase with subagent containers)
                         if self._has_subagent_files(state):
                             if await self._sync_files_if_needed(state):
-                                await self._refresh_seen_mtimes(state)
+                                subagent_files_changed = True
 
                         if not self._is_file_watcher_available() and session_id not in self._jsonl_sync_requests:
                             main_jsonl_signature = self._changed_main_jsonl_signature(state)
 
                     # JSONL sync must stay outside the watcher lock because it dispatches events.
-                    if main_jsonl_signature is not None:
+                    # Mark subagent files seen only after sync succeeds, otherwise a failed
+                    # sync is treated as consumed and never retried.
+                    if subagent_files_changed or main_jsonl_signature is not None:
                         await self._on_jsonl_sync(session_id, state.workdir)
-                        self._main_jsonl_signatures[session_id] = main_jsonl_signature
+                        if subagent_files_changed:
+                            await self._refresh_seen_mtimes(state)
+                        if main_jsonl_signature is not None:
+                            self._main_jsonl_signatures[session_id] = main_jsonl_signature
                     await self._maybe_process_jsonl_sync(session_id)
                 except asyncio.CancelledError:
                     raise
@@ -394,7 +400,6 @@ class SessionSupervisor:
             break
         if changed:
             self._claude_jsonl_parser.reset_state(state.claude_session_id or state.session_id)
-            await self._on_jsonl_sync(state.session_id, state.workdir)
         return changed
 
     async def _refresh_seen_mtimes(self, state: SessionState) -> None:
