@@ -1,17 +1,22 @@
-"""External Ghostty session input service.
+"""External terminal session input service.
 
 The single orchestration point for everything described in
-``docs/specs/2026-08-03-external-ghostty-input-design.md`` §4-9: pairing a
-bound external Claude session to a Ghostty terminal surface, activating an
-input target from ``/list``, and sending ordinary Telegram text (or an
-unregistered slash command) into the verified Claude TUI — or enqueuing it
-while Claude is busy and draining later.
+``docs/specs/2026-08-03-external-ghostty-input-design.md`` §4-9 and extended to
+kitty by ``docs/specs/2026-10-29-external-kitty-input-design.md``: pairing a
+bound external Claude session to a terminal surface, activating an input target
+from ``/list``, and sending ordinary Telegram text (or an unregistered slash
+command) into the verified Claude TUI — or enqueuing it while Claude is busy
+and draining later.
 
-Why a service: handlers must NOT touch ``GhosttyTerminalAdapter``,
+Terminal emulators are pluggable: every operation resolves the backend from the
+target's ``kind`` through ``_backend_for``. Nothing here may assume Ghostty.
+
+Why a service: handlers must NOT touch a terminal adapter,
 ``LocalProcessProbe``, ``ExternalBindingStore`` internals, the pairing
-registry, or ``osascript`` directly. They route through this service, which
-owns the per-session input lock, the in-flight marker, the drain task and the
-security-ordered checks (owner → binding generation → process/TTY → terminal).
+registry, or ``osascript``/``kitten`` directly. They route through this
+service, which owns the per-session input lock, the in-flight marker, the
+drain task and the security-ordered checks (owner → binding generation →
+process/TTY → terminal).
 
 Concurrency invariants (design §6 / §9):
   * Per-session sending is serialised by ``_input_locks`` (a
@@ -32,18 +37,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from app.adapters.process.ghostty_terminal_adapter import (
-    GhosttyTerminal,
-    GhosttyTerminalAdapter,
-    InjectionOutcome,
-)
-from app.domain.external_session_models import ExternalBinding, GhosttyInputTarget
+from app.domain.external_session_models import ExternalBinding, ExternalTerminalTarget
+from app.domain.external_terminal_models import ExternalTerminal, TerminalKind, TerminalOutcome
 from app.domain.models import utc_now
+from app.domain.protocols import ExternalTerminalBackendProtocol
 from app.domain.session_models import SessionPhase
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
     ExternalQuestionActionResult,
     ExternalQuestionActionStatus,
+    ExternalTerminalQuestionTarget,
     ExternalUserQuestionContext,
 )
 from app.infra.lock_registry import RefCountedLockRegistry
@@ -124,14 +126,18 @@ _SENDABLE_PHASES = frozenset({SessionPhase.IDLE, SessionPhase.WAITING_FOR_INPUT}
 # Injection failures that the adapter reports BEFORE anything was pasted into
 # the terminal. Single source of truth shared by both injection paths:
 # ``send_text`` maps them to ``ADAPTER_UNAVAILABLE``; the drain treats the
-# dequeued entry as safe to restore and retry once Ghostty becomes reachable.
+# dequeued entry as safe to restore and retry once the terminal becomes
+# reachable again.
 _RETRYABLE_PREFLIGHT_OUTCOMES = frozenset(
     {
-        InjectionOutcome.GHOSTTY_NOT_RUNNING,
-        InjectionOutcome.APPLESCRIPT_DISABLED,
-        InjectionOutcome.NON_DARWIN,
-        InjectionOutcome.OSASCRIPT_MISSING,
-        InjectionOutcome.TCC_DENIED,
+        TerminalOutcome.GHOSTTY_NOT_RUNNING,
+        TerminalOutcome.APPLESCRIPT_DISABLED,
+        TerminalOutcome.NON_DARWIN,
+        TerminalOutcome.OSASCRIPT_MISSING,
+        TerminalOutcome.TCC_DENIED,
+        TerminalOutcome.KITTY_NOT_RUNNING,
+        TerminalOutcome.KITTY_REMOTE_CONTROL_DISABLED,
+        TerminalOutcome.KITTY_BIN_MISSING,
     }
 )
 
@@ -150,7 +156,8 @@ class PairingCandidates:
 
     binding_id: str
     paired_tty: str  # the trust anchor resolved from the Claude PID
-    terminals: list[GhosttyTerminal]
+    terminals: list[ExternalTerminal]
+    binding_pid: int | None = None  # lets the UI mark candidates that match it
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,12 +170,16 @@ class _DrainSlot:
 
 
 class ExternalSessionInputService:
-    """Pairing + activation + send/drain for external Ghostty input.
+    """Pairing + activation + send/drain for external terminal input.
 
     Construct with a feature flag ``enabled`` (mirrors
-    ``Settings.GHOSTTY_INPUT_ENABLED``); when False, every method short-circuits
-    to ``PairingNotEnabled`` / ``SendOutcome.ADAPTER_UNAVAILABLE`` so the rest of
-    the binding/reply system keeps working.
+    ``Settings.external_input_enabled``); when False, every method
+    short-circuits to ``PairingNotEnabled`` / ``SendOutcome.ADAPTER_UNAVAILABLE``
+    so the rest of the binding/reply system keeps working.
+
+    ``backends`` maps each available terminal kind to its adapter. A kind that
+    is absent (feature off, or not configured) makes every operation that
+    targets it fail closed with ``ADAPTER_UNAVAILABLE``.
     """
 
     def __init__(
@@ -177,7 +188,7 @@ class ExternalSessionInputService:
         enabled: bool,
         binding_store: ExternalBindingStore,
         session_store: SessionStore,
-        ghostty_adapter: GhosttyTerminalAdapter,
+        backends: dict[TerminalKind, ExternalTerminalBackendProtocol],
         process_probe: LocalProcessProbe,
         pairing_registry: PairingCallbackRegistry,
         input_mode_store: ExternalInputTargetStore,
@@ -192,7 +203,7 @@ class ExternalSessionInputService:
         self._enabled = enabled
         self._binding_store = binding_store
         self._session_store = session_store
-        self._adapter = ghostty_adapter
+        self._backends = dict(backends)
         self._probe = process_probe
         self._notify_user = notify_user
         self._pairing = pairing_registry
@@ -220,11 +231,12 @@ class ExternalSessionInputService:
         user_id: int,
         session_id: str,
     ) -> tuple[PairOutcome, PairingCandidates | None]:
-        """Resolve the pairing trust anchor and enumerate Ghostty terminals.
+        """Resolve the pairing trust anchor and enumerate terminal candidates.
 
-        Returns ``(PairingCandidates)`` for display, or a refusal outcome.
-        Caller (handler) then registers a token per chosen terminal and sends
-        inline buttons.
+        Merges every enabled backend's windows into one list. Returns
+        ``(PairingCandidates)`` for display, or a refusal outcome. Caller
+        (handler) then registers a token per chosen terminal and sends inline
+        buttons.
         """
         if not self._enabled:
             return PairOutcome.PAIRING_NOT_ENABLED, None
@@ -233,7 +245,8 @@ class ExternalSessionInputService:
             return PairOutcome.NOT_OWNER, None
         if binding.ended_at is not None:
             return PairOutcome.SESSION_ENDED, None
-        if not self._adapter.is_available():
+        backends = [backend for backend in self._backends.values() if backend.is_available()]
+        if not backends:
             return PairOutcome.ADAPTER_UNAVAILABLE, None
 
         paired_tty = self._resolve_paired_tty(binding)
@@ -246,25 +259,36 @@ class ExternalSessionInputService:
         if not process.ok:
             return PairOutcome.PROCESS_INVALID, None
 
-        terminals, _err = await self._adapter.list_terminals()
-        if terminals is None:
-            # Ghostty down / TCC / disabled / not on darwin: pairing is
-            # currently impossible, but the external binding remains usable.
+        terminals: list[ExternalTerminal] = []
+        failures = 0
+        for backend in backends:
+            listed, _err = await backend.list_terminals()
+            if listed is None:
+                failures += 1
+                continue
+            terminals.extend(listed)
+        if failures == len(backends):
+            # Every enabled backend is currently unusable (Ghostty down / TCC /
+            # kitty socket gone): pairing is impossible right now, but the
+            # external binding itself remains usable.
             return PairOutcome.ADAPTER_UNAVAILABLE, None
         if not terminals:
             return PairOutcome.NO_TERMINALS, None
 
-        # Ghostty 1.3 does not expose terminal PID/TTY, so cwd/title are display
-        # hints only and MUST NOT auto-select a target. Put exact-cwd candidates
-        # first while preserving adapter order within each group; the handler
-        # shows enough identity for the owner to choose explicitly.
-        terminals = sorted(terminals, key=lambda terminal: terminal.cwd != binding.cwd)
+        # Candidates are ordered for display only and MUST NOT auto-select a
+        # target. Ghostty 1.3 exposes neither PID nor TTY, so its entries can
+        # only match on cwd; kitty additionally reports the window PID and the
+        # foreground processes, which is the strongest available signal that a
+        # window is the one running the bound Claude process.
+        pid = binding.pid or 0
+        terminals = sorted(terminals, key=lambda terminal: _candidate_rank(terminal, pid=pid, cwd=binding.cwd))
         return (
             PairOutcome.NEEDS_PAIRING,
             PairingCandidates(
                 binding_id=binding.binding_id,
                 paired_tty=paired_tty,
                 terminals=terminals,
+                binding_pid=binding.pid,
             ),
         )
 
@@ -274,6 +298,7 @@ class ExternalSessionInputService:
         user_id: int,
         session_id: str,
         expected_binding_id: str,
+        terminal_kind: TerminalKind,
         terminal_id: str,
     ) -> str | None:
         """Issue a short-lived token for one displayed terminal candidate.
@@ -287,10 +312,13 @@ class ExternalSessionInputService:
         binding = self._binding_store.get_binding(session_id)
         if binding is None or binding.user_id != user_id or binding.ended_at is not None or binding.binding_id != expected_binding_id:
             return None
+        if terminal_kind not in self._backends:
+            return None
         return await self._pairing.register_token(
             user_id=user_id,
             session_id=session_id,
             binding_id=binding.binding_id,
+            terminal_kind=terminal_kind,
             terminal_id=terminal_id,
         )
 
@@ -309,8 +337,6 @@ class ExternalSessionInputService:
         """
         if not self._enabled:
             return PairOutcome.PAIRING_NOT_ENABLED
-        if not self._adapter.is_available():
-            return PairOutcome.ADAPTER_UNAVAILABLE
         result: PairConsumeResult = await self._pairing.consume(token, user_id)
         if not isinstance(result, PairConsumeOk):
             if isinstance(result, PairConsumeUnauthorized):
@@ -327,16 +353,19 @@ class ExternalSessionInputService:
                 # ABA: token was issued under a generation that no longer matches.
                 return PairOutcome.BINDING_STALE
 
-            ok, terminal, terminal_error = await self._adapter.validate_terminal(snap.terminal_id)
+            backend = self._backend_for(snap.terminal_kind)
+            if backend is None or not backend.is_available():
+                return PairOutcome.ADAPTER_UNAVAILABLE
+            ok, terminal, terminal_error = await backend.validate_terminal(snap.terminal_id)
             if not ok or terminal is None:
                 return (
                     PairOutcome.TERMINAL_INVALID
-                    if terminal_error in {InjectionOutcome.NOT_FOUND, InjectionOutcome.NOT_UNIQUE}
+                    if terminal_error in {TerminalOutcome.NOT_FOUND, TerminalOutcome.NOT_UNIQUE}
                     else PairOutcome.ADAPTER_UNAVAILABLE
                 )
 
-            # validate_terminal awaited AppleScript; repeat binding/process checks
-            # while holding the same lock used by question actions.
+            # validate_terminal is a subprocess await; repeat binding/process
+            # checks while holding the same lock used by question actions.
             binding = self._binding_store.get_binding(snap.session_id)
             if binding is None or binding.user_id != user_id or binding.binding_id != snap.binding_id:
                 return PairOutcome.BINDING_STALE
@@ -352,20 +381,22 @@ class ExternalSessionInputService:
             if not process.ok:
                 return PairOutcome.PROCESS_INVALID
 
-            old_target = binding.ghostty_target
+            old_target = binding.terminal_target
             if old_target is not None and self._external_uq_state is not None:
-                self._external_uq_state.invalidate_ghostty_target(
+                self._external_uq_state.invalidate_terminal_target(
                     session_id=snap.session_id,
                     binding_id=old_target.binding_id,
+                    kind=old_target.kind,
                     terminal_id=old_target.terminal_id,
                     paired_tty=old_target.paired_tty,
                     paired_at=old_target.paired_at,
                 )
             if old_target is not None and self._uq_callback_registry is not None:
                 await self._uq_callback_registry.invalidate_session(snap.session_id)
-            saved = self._binding_store.set_ghostty_target(
+            saved = self._binding_store.set_terminal_target(
                 snap.session_id,
                 binding.binding_id,
+                kind=snap.terminal_kind,
                 terminal_id=snap.terminal_id,
                 paired_tty=paired_tty,
                 paired_at=utc_now(),
@@ -393,7 +424,7 @@ class ExternalSessionInputService:
     ) -> PairOutcome:
         """Activated from ``/list`` for an already-bound session.
 
-        If a valid persisted Ghostty target exists, sets it as the user's
+        If a valid persisted terminal target exists, sets it as the user's
         current input session and returns ``ACTIVATED``. If no target or the
         target/process no longer validating, returns ``NEEDS_PAIRING`` so the
         handler kicks off pairing. Returns ``NOT_OWNER`` for foreign bindings
@@ -406,19 +437,20 @@ class ExternalSessionInputService:
             return PairOutcome.NOT_OWNER
         if binding.ended_at is not None:
             return PairOutcome.SESSION_ENDED
-        target = binding.ghostty_target
+        target = binding.terminal_target
         if target is None:
             return PairOutcome.NEEDS_PAIRING
         if target.binding_id != binding.binding_id:
-            self._binding_store.clear_ghostty_target(session_id, binding.binding_id)
+            self._binding_store.clear_terminal_target(session_id, binding.binding_id)
             return PairOutcome.BINDING_STALE
-        if not self._adapter.is_available():
+        backend = self._backend_for(target.kind)
+        if backend is None or not backend.is_available():
             return PairOutcome.ADAPTER_UNAVAILABLE
 
-        ok, _terminal, terminal_error = await self._adapter.validate_terminal(target.terminal_id)
+        ok, _terminal, terminal_error = await backend.validate_terminal(target.terminal_id)
         if not ok:
-            if terminal_error in {InjectionOutcome.NOT_FOUND, InjectionOutcome.NOT_UNIQUE}:
-                self._binding_store.clear_ghostty_target(session_id, binding.binding_id)
+            if terminal_error in {TerminalOutcome.NOT_FOUND, TerminalOutcome.NOT_UNIQUE}:
+                self._binding_store.clear_terminal_target(session_id, binding.binding_id)
                 return PairOutcome.NEEDS_PAIRING
             return PairOutcome.ADAPTER_UNAVAILABLE
 
@@ -586,28 +618,29 @@ class ExternalSessionInputService:
                 # Stale selection from before a rebind.
                 await self._mode_store.clear_target(user_id)
                 return SendOutcome.BINDING_STALE
-            ghostty_target = binding.ghostty_target
-            if ghostty_target is None:
+            terminal_target = binding.terminal_target
+            if terminal_target is None:
                 await self._mode_store.clear_target(user_id)
                 return SendOutcome.NOT_PAIRED
-            if ghostty_target.binding_id != binding.binding_id:
-                self._binding_store.clear_ghostty_target(session_id, binding.binding_id)
+            if terminal_target.binding_id != binding.binding_id:
+                self._binding_store.clear_terminal_target(session_id, binding.binding_id)
                 await self._mode_store.clear_target(user_id)
                 return SendOutcome.BINDING_STALE
-            if not self._adapter.is_available():
+            backend = self._backend_for(terminal_target.kind)
+            if backend is None or not backend.is_available():
                 return SendOutcome.ADAPTER_UNAVAILABLE
 
             process = await self._validate_foreground(
                 pid=binding.pid or 0,
-                paired_tty=ghostty_target.paired_tty,
+                paired_tty=terminal_target.paired_tty,
             )
             if not process.ok:
                 return SendOutcome.PROCESS_INVALID
 
-            ok, _terminal, terminal_error = await self._adapter.validate_terminal(ghostty_target.terminal_id)
+            ok, _terminal, terminal_error = await backend.validate_terminal(terminal_target.terminal_id)
             if not ok:
-                if terminal_error in {InjectionOutcome.NOT_FOUND, InjectionOutcome.NOT_UNIQUE}:
-                    self._binding_store.clear_ghostty_target(session_id, binding.binding_id)
+                if terminal_error in {TerminalOutcome.NOT_FOUND, TerminalOutcome.NOT_UNIQUE}:
+                    self._binding_store.clear_terminal_target(session_id, binding.binding_id)
                     await self._mode_store.clear_target_for_session(session_id)
                     await self._notify_queue_cleared(session_id, user_id=user_id, reason="配对的终端已失效")
                     return SendOutcome.TERMINAL_INVALID
@@ -617,11 +650,11 @@ class ExternalSessionInputService:
                 session_id=session_id,
                 user_id=user_id,
                 expected_binding_id=binding.binding_id,
-                expected_target=ghostty_target,
+                expected_target=terminal_target,
             )
             if current is None:
                 return SendOutcome.BINDING_STALE
-            binding, ghostty_target = current
+            binding, terminal_target = current
 
             if session_id in self._in_flight:
                 # A previous send is mid-flight (between our inject and the
@@ -639,46 +672,46 @@ class ExternalSessionInputService:
                 session_id=session_id,
                 user_id=user_id,
                 expected_binding_id=binding.binding_id,
-                expected_target=ghostty_target,
+                expected_target=terminal_target,
             )
             if current is None:
                 return SendOutcome.BINDING_STALE
-            binding, ghostty_target = current
+            binding, terminal_target = current
             if queue_pending:
                 # Preserve FIFO even if a new message wins the input lock just
                 # as the session becomes ready before the existing drain does.
                 return await self._enqueue(session_id, binding.binding_id, payload)
 
-            # Terminal validation above can block on AppleScript for seconds.
+            # Terminal validation above can block on a subprocess for seconds.
             # Re-check the process trust anchor immediately before injection so
             # a shell that took over during that await never receives text+Enter.
             process = await self._validate_foreground(
                 pid=binding.pid or 0,
-                paired_tty=ghostty_target.paired_tty,
+                paired_tty=terminal_target.paired_tty,
             )
             if not process.ok:
                 return SendOutcome.PROCESS_INVALID
 
             self._injecting.add(session_id)
             try:
-                outcome = await self._adapter.inject_text(ghostty_target.terminal_id, payload)
+                outcome = await backend.inject_text(terminal_target.terminal_id, payload)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("ghostty inject raised", extra={"session_id": session_id})
+                logger.exception("external terminal inject raised", extra={"session_id": session_id})
                 return SendOutcome.INJECTION_FAILED
             else:
-                if outcome == InjectionOutcome.OK:
+                if outcome == TerminalOutcome.OK:
                     # Stay in _injecting until the guard timer is armed. Arming
-                    # waits on the lifecycle lock; a Stop scheduled during
-                    # AppleScript would otherwise clear the new guard and the
+                    # waits on the lifecycle lock; a Stop scheduled during the
+                    # injection would otherwise clear the new guard and the
                     # mismatched generation would then skip the timer.
                     await self._mark_in_flight(session_id)
             finally:
                 self._injecting.discard(session_id)
-            if outcome == InjectionOutcome.OK:
+            if outcome == TerminalOutcome.OK:
                 return SendOutcome.SENT
-            if outcome == InjectionOutcome.INDETERMINATE:
+            if outcome == TerminalOutcome.INDETERMINATE:
                 return SendOutcome.INJECTION_INDETERMINATE
             if outcome in _RETRYABLE_PREFLIGHT_OUTCOMES:
                 return SendOutcome.ADAPTER_UNAVAILABLE
@@ -807,13 +840,13 @@ class ExternalSessionInputService:
         if not self._enabled or state is None:
             return ExternalQuestionActionResult(
                 ExternalQuestionActionStatus.REJECTED,
-                "外部 Ghostty 问答功能未启用",
+                "外部终端问答功能未启用",
             )
         target = context.target
-        if not isinstance(target, ExternalGhosttyQuestionTarget):
+        if not isinstance(target, ExternalTerminalQuestionTarget):
             return ExternalQuestionActionResult(
                 ExternalQuestionActionStatus.REJECTED,
-                "该问题目标不支持 Ghostty 注入",
+                "该问题目标不支持终端注入",
             )
 
         async with self._input_locks.lock(context.session_id):
@@ -849,12 +882,13 @@ class ExternalSessionInputService:
             if binding is None:
                 return ExternalQuestionActionResult(
                     ExternalQuestionActionStatus.REJECTED,
-                    "外部会话绑定或 Ghostty 配对已变化",
+                    "外部会话绑定或终端配对已变化",
                 )
-            if not self._adapter.is_available():
+            backend = self._backend_for(target.kind)
+            if backend is None or not backend.is_available():
                 return ExternalQuestionActionResult(
                     ExternalQuestionActionStatus.REJECTED,
-                    "Ghostty 适配器不可用",
+                    "终端适配器不可用",
                 )
             process = await self._validate_foreground(
                 pid=binding.pid or 0,
@@ -866,14 +900,14 @@ class ExternalSessionInputService:
                     "无法验证前台 Claude 进程",
                 )
 
-            terminal_ok, _terminal, terminal_error = await self._adapter.validate_terminal(target.terminal_id)
+            terminal_ok, _terminal, terminal_error = await backend.validate_terminal(target.terminal_id)
             if not terminal_ok:
                 return ExternalQuestionActionResult(
                     ExternalQuestionActionStatus.REJECTED,
-                    f"Ghostty 终端不可用: {terminal_error or 'unknown'}",
+                    f"终端不可用: {terminal_error or 'unknown'}",
                 )
 
-            # validate_terminal is an AppleScript await. Re-read every mutable
+            # validate_terminal is a subprocess await. Re-read every mutable
             # security anchor and foreground status before sending any key.
             pending = state.get_active(context.tool_use_id)
             binding = self._binding_for_question_context(context)
@@ -895,21 +929,21 @@ class ExternalSessionInputService:
             self._injecting.add(context.session_id)
             try:
                 if action == "select":
-                    outcome = await self._adapter.select_user_question_option(
+                    outcome = await backend.select_user_question_option(
                         target.terminal_id,
                         option_count=option_count,
                         option_index=option_index,
                         submit_after=final_action,
                     )
                 elif action == "answer_text":
-                    outcome = await self._adapter.answer_user_question_with_text(
+                    outcome = await backend.answer_user_question_with_text(
                         target.terminal_id,
                         option_count=option_count,
                         text=text,
                         submit_after=final_action,
                     )
                 elif action == "advance_multi":
-                    outcome = await self._adapter.advance_user_question_after_multi_select(
+                    outcome = await backend.advance_user_question_after_multi_select(
                         target.terminal_id,
                         option_count=option_count,
                         final_question=final_action,
@@ -920,12 +954,12 @@ class ExternalSessionInputService:
                 state.mark_indeterminate(
                     tool_use_id=context.tool_use_id,
                     expected_target=context.target,
-                    reason="Ghostty 问答操作被取消，终端状态不确定",
+                    reason="终端问答操作被取消，终端状态不确定",
                 )
                 raise
             except Exception:
                 logger.exception(
-                    "ghostty user-question action raised",
+                    "external terminal user-question action raised",
                     extra={
                         "session_id": context.session_id,
                         "tool_use_id": context.tool_use_id,
@@ -935,16 +969,16 @@ class ExternalSessionInputService:
                 state.mark_indeterminate(
                     tool_use_id=context.tool_use_id,
                     expected_target=context.target,
-                    reason="Ghostty 问答操作异常，终端状态不确定",
+                    reason="终端问答操作异常，终端状态不确定",
                 )
                 return ExternalQuestionActionResult(
                     ExternalQuestionActionStatus.INDETERMINATE,
-                    "Ghostty 操作结果不确定，请检查终端",
+                    "终端操作结果不确定，请检查终端",
                 )
             finally:
                 self._injecting.discard(context.session_id)
 
-            if outcome == InjectionOutcome.OK:
+            if outcome == TerminalOutcome.OK:
                 if final_action and not state.mark_terminal_action_applied(
                     tool_use_id=context.tool_use_id,
                     expected_target=context.target,
@@ -960,19 +994,19 @@ class ExternalSessionInputService:
                     )
                 return ExternalQuestionActionResult(ExternalQuestionActionStatus.APPLIED)
 
-            if outcome in {InjectionOutcome.INDETERMINATE, InjectionOutcome.TIMEOUT}:
+            if outcome in {TerminalOutcome.INDETERMINATE, TerminalOutcome.TIMEOUT}:
                 state.mark_indeterminate(
                     tool_use_id=context.tool_use_id,
                     expected_target=context.target,
-                    reason=f"Ghostty 问答操作结果不确定: {outcome}",
+                    reason=f"终端问答操作结果不确定: {outcome}",
                 )
                 return ExternalQuestionActionResult(
                     ExternalQuestionActionStatus.INDETERMINATE,
-                    "Ghostty 操作结果不确定，请检查终端",
+                    "终端操作结果不确定，请检查终端",
                 )
             return ExternalQuestionActionResult(
                 ExternalQuestionActionStatus.REJECTED,
-                f"Ghostty 问答操作失败: {outcome}",
+                f"终端问答操作失败: {outcome}",
             )
 
     @staticmethod
@@ -997,15 +1031,16 @@ class ExternalSessionInputService:
         context: ExternalUserQuestionContext,
     ) -> ExternalBinding | None:
         target = context.target
-        if not isinstance(target, ExternalGhosttyQuestionTarget):
-            # Only Ghostty-bound sessions carry an injectable question target.
+        if not isinstance(target, ExternalTerminalQuestionTarget):
+            # Only terminal-bound sessions carry an injectable question target.
             return None
         binding = self._binding_store.get_binding(context.session_id)
         if binding is None or binding.user_id != context.user_id or binding.ended_at is not None or binding.binding_id != target.binding_id:
             return None
-        binding_target = binding.ghostty_target
+        binding_target = binding.terminal_target
         if (
             binding_target is None
+            or binding_target.kind != target.kind
             or binding_target.binding_id != target.binding_id
             or binding_target.terminal_id != target.terminal_id
             or binding_target.paired_tty != target.paired_tty
@@ -1020,16 +1055,20 @@ class ExternalSessionInputService:
         session_id: str,
         user_id: int,
         expected_binding_id: str,
-        expected_target: GhosttyInputTarget,
-    ) -> tuple[ExternalBinding, GhosttyInputTarget] | None:
+        expected_target: ExternalTerminalTarget,
+    ) -> tuple[ExternalBinding, ExternalTerminalTarget] | None:
         """Re-read binding/target after an await and enforce the ABA snapshot."""
         binding = self._binding_store.get_binding(session_id)
         if binding is None or binding.user_id != user_id or binding.ended_at is not None or binding.binding_id != expected_binding_id:
             return None
-        target = binding.ghostty_target
+        target = binding.terminal_target
         if target is None or target.binding_id != binding.binding_id or target != expected_target:
             return None
         return binding, target
+
+    def _backend_for(self, kind: TerminalKind) -> ExternalTerminalBackendProtocol | None:
+        """Resolve the backend that owns ``kind``, or None when unavailable."""
+        return self._backends.get(kind)
 
     def _is_sendable(self, session_id: str) -> bool:
         state = self._session_store.get(session_id)
@@ -1444,7 +1483,7 @@ class ExternalSessionInputService:
 
         if binding is None or binding.ended_at is not None:
             return await self._abort_drain_locked(session_id, user_id=user_id, reason="会话已结束")
-        target = binding.ghostty_target
+        target = binding.terminal_target
         if target is None or target.binding_id != binding.binding_id:
             return await self._abort_drain_locked(session_id, user_id=user_id, reason="绑定已变更，请重新配对")
 
@@ -1454,12 +1493,13 @@ class ExternalSessionInputService:
         )
         if not process.ok:
             return _DrainStep.WAIT, notices
-        if not self._adapter.is_available():
+        backend = self._backend_for(target.kind)
+        if backend is None or not backend.is_available():
             return _DrainStep.WAIT, notices
-        terminal_ok, _terminal, terminal_error = await self._adapter.validate_terminal(target.terminal_id)
+        terminal_ok, _terminal, terminal_error = await backend.validate_terminal(target.terminal_id)
         if not terminal_ok:
-            if terminal_error in {InjectionOutcome.NOT_FOUND, InjectionOutcome.NOT_UNIQUE}:
-                self._binding_store.clear_ghostty_target(session_id, binding.binding_id)
+            if terminal_error in {TerminalOutcome.NOT_FOUND, TerminalOutcome.NOT_UNIQUE}:
+                self._binding_store.clear_terminal_target(session_id, binding.binding_id)
                 await self._mode_store.clear_target_for_session(session_id)
                 return await self._abort_drain_locked(session_id, user_id=user_id, reason="配对的终端已失效")
             return _DrainStep.WAIT, notices
@@ -1534,11 +1574,11 @@ class ExternalSessionInputService:
 
             self._injecting.add(session_id)
             try:
-                outcome = await self._adapter.inject_text(target.terminal_id, entry.text)
+                outcome = await backend.inject_text(target.terminal_id, entry.text)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("ghostty drain inject raised", extra={"session_id": session_id})
+                logger.exception("external terminal drain inject raised", extra={"session_id": session_id})
                 # Drop the flag before the awaited cleanup. `return await` runs
                 # before `finally`, and a Stop during that await must not be ignored.
                 self._injecting.discard(session_id)
@@ -1550,17 +1590,17 @@ class ExternalSessionInputService:
                     terminal_state_unknown=True,
                 )
             else:
-                if outcome == InjectionOutcome.OK:
+                if outcome == TerminalOutcome.OK:
                     # Same window as send_text: hold _injecting across arming.
                     await self._mark_in_flight(session_id)
             finally:
                 self._injecting.discard(session_id)
-            if outcome == InjectionOutcome.OK:
+            if outcome == TerminalOutcome.OK:
                 return _DrainStep.INJECTED, notices
             if outcome in _RETRYABLE_PREFLIGHT_OUTCOMES:
                 # Preflight failure before anything was pasted (same set send_text
                 # maps to ADAPTER_UNAVAILABLE): restore the head and wait for
-                # Ghostty to become reachable again.
+                # the terminal to become reachable again.
                 restored = await self._queue.prepend(session_id, entry)
                 if not restored:
                     logger.warning(
@@ -1574,12 +1614,12 @@ class ExternalSessionInputService:
                         detail=f"{outcome}，恢复失败",
                     )
                 logger.info(
-                    "ghostty drain deferred until adapter recovers",
+                    "external terminal drain deferred until adapter recovers",
                     extra={"session_id": session_id, "outcome": outcome},
                 )
                 return _DrainStep.WAIT, notices
             logger.warning(
-                "ghostty drain inject failed",
+                "external terminal drain inject failed",
                 extra={"session_id": session_id, "outcome": outcome},
             )
             # The dequeued entry may or may not have been pasted (INDETERMINATE/
@@ -1613,3 +1653,24 @@ class ExternalSessionInputService:
 def _normalise_text(text: str) -> str:
     """Normalise CRLF/CR to LF (design §8). No shell escaping."""
     return normalize_line_endings(text)
+
+
+def _candidate_rank(terminal: ExternalTerminal, *, pid: int, cwd: str) -> tuple[int, int]:
+    """Order pairing candidates by how likely they host the bound process.
+
+    Ranking is display-only and MUST NOT drive automatic selection: a wrong
+    rank can cost the owner one glance, a wrong auto-pair injects text into an
+    unrelated shell. Ties keep backend listing order (``sorted`` is stable).
+
+      0  ``pid`` is among the window's foreground processes (kitty, strongest)
+      1  ``pid`` is the window's own process (kitty)
+      2  ``cwd`` matches the binding cwd (Ghostty's only signal, kitty fallback)
+      3  everything else
+    """
+    if pid > 0 and pid in terminal.foreground_pids:
+        return (0, 0)
+    if pid > 0 and terminal.pid == pid:
+        return (1, 0)
+    if cwd and terminal.cwd == cwd:
+        return (2, 0)
+    return (3, 0)

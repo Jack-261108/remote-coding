@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_ALLOWED_EXTENSIONS: list[str] = [
@@ -188,14 +188,39 @@ class Settings(BaseSettings):
     tombstone_ttl_sec: int = Field(3600, alias="TOMBSTONE_TTL_SEC")
     push_notification_retry_count: int = Field(1, alias="PUSH_NOTIFICATION_RETRY_COUNT")
 
-    # External Ghostty session input (design specs/2026-08-03-external-ghostty-input-design.md §4-9).
+    # External terminal session input (design specs/2026-08-03-external-ghostty-input-design.md §4-9,
+    # extended to kitty by specs/2026-10-29-external-kitty-input-design.md).
     # Off by default; the rest of the binding/permission/reply system keeps working when disabled.
-    ghostty_input_enabled: bool = Field(False, alias="GHOSTTY_INPUT_ENABLED")
+    # The GHOSTTY_* names stay accepted as aliases so existing .env files keep working.
+    external_input_enabled: bool = Field(False, validation_alias=AliasChoices("EXTERNAL_INPUT_ENABLED", "GHOSTTY_INPUT_ENABLED"))
     ghostty_applescript_enabled: bool = Field(True, alias="GHOSTTY_APPLESCRIPT_ENABLED")
-    ghostty_pairing_token_ttl_sec: int = Field(180, alias="GHOSTTY_PAIRING_TOKEN_TTL_SEC", ge=1)
-    ghostty_input_queue_max_size: int = Field(5, alias="GHOSTTY_INPUT_QUEUE_MAX_SIZE", ge=1)
-    ghostty_input_queue_ttl_sec: int = Field(300, alias="GHOSTTY_INPUT_QUEUE_TTL_SEC", ge=1)
-    ghostty_drain_publish_wait_timeout_sec: float = Field(30.0, alias="GHOSTTY_DRAIN_PUBLISH_WAIT_TIMEOUT_SEC", gt=0)
+    external_pairing_token_ttl_sec: int = Field(
+        180,
+        validation_alias=AliasChoices("EXTERNAL_PAIRING_TOKEN_TTL_SEC", "GHOSTTY_PAIRING_TOKEN_TTL_SEC"),
+        ge=1,
+    )
+    external_input_queue_max_size: int = Field(
+        5,
+        validation_alias=AliasChoices("EXTERNAL_INPUT_QUEUE_MAX_SIZE", "GHOSTTY_INPUT_QUEUE_MAX_SIZE"),
+        ge=1,
+    )
+    external_input_queue_ttl_sec: int = Field(
+        300,
+        validation_alias=AliasChoices("EXTERNAL_INPUT_QUEUE_TTL_SEC", "GHOSTTY_INPUT_QUEUE_TTL_SEC"),
+        ge=1,
+    )
+    external_drain_publish_wait_timeout_sec: float = Field(
+        30.0,
+        validation_alias=AliasChoices("EXTERNAL_DRAIN_PUBLISH_WAIT_TIMEOUT_SEC", "GHOSTTY_DRAIN_PUBLISH_WAIT_TIMEOUT_SEC"),
+        gt=0,
+    )
+
+    # kitty backend (remote control over a UNIX socket).
+    kitty_input_enabled: bool = Field(True, alias="KITTY_INPUT_ENABLED")
+    kitty_bin: str = Field("kitten", alias="KITTY_BIN")
+    kitty_listen_on: str = Field("", alias="KITTY_LISTEN_ON")
+    kitty_timeout_sec: float = Field(5.0, alias="KITTY_TIMEOUT_SEC", gt=0)
+    kitty_key_delay_sec: float = Field(0.05, alias="KITTY_KEY_DELAY_SEC", gt=0)
 
     # TTL for opaque AskUserQuestion callback tokens (managed + external). Aligned
     # with the external pending-question TTL so a live button never resolves against
@@ -378,8 +403,9 @@ class Settings(BaseSettings):
         "claude_install_hooks",
         "jsonl_file_watcher_enabled",
         "auto_file_send_enabled",
-        "ghostty_input_enabled",
+        "external_input_enabled",
         "ghostty_applescript_enabled",
+        "kitty_input_enabled",
         mode="before",
     )
     @classmethod
@@ -438,9 +464,9 @@ class Settings(BaseSettings):
         "zip_max_size_mb",
         "push_notification_retry_count",
         "tombstone_ttl_sec",
-        "ghostty_pairing_token_ttl_sec",
-        "ghostty_input_queue_max_size",
-        "ghostty_input_queue_ttl_sec",
+        "external_pairing_token_ttl_sec",
+        "external_input_queue_max_size",
+        "external_input_queue_ttl_sec",
         "user_question_callback_ttl_sec",
     )
     @classmethod
@@ -468,7 +494,9 @@ class Settings(BaseSettings):
         "spinner_interval_sec",
         "session_health_check_interval_sec",
         "external_session_stale_timeout_sec",
-        "ghostty_drain_publish_wait_timeout_sec",
+        "external_drain_publish_wait_timeout_sec",
+        "kitty_timeout_sec",
+        "kitty_key_delay_sec",
     )
     @classmethod
     def validate_positive_float(cls, value: float) -> float:

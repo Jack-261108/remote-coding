@@ -14,9 +14,9 @@ from app.domain.protocols import (
 )
 from app.domain.session_models import PermissionDecisionPayload, SessionEvent, SessionEventType, SessionPhase, SessionState, ToolStatus
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
     ExternalQuestionActionResult,
     ExternalQuestionActionStatus,
+    ExternalTerminalQuestionTarget,
     ExternalUserQuestionContext,
     UserQuestionPrompt,
     compose_user_question_answers,
@@ -88,7 +88,7 @@ class UserQuestionService:
         external_question_transport: ExternalClaudeUserQuestionTransportProtocol | None,
         callback_registry: UserQuestionCallbackRegistry | None,
     ) -> None:
-        """Late-bind external Ghostty question state/transport/callback registry.
+        """Late-bind external terminal question state/transport/callback registry.
 
         Called once by the composition root after all external services are built,
         to avoid reordering the bootstrap dependency ring (design §6 / §10).
@@ -157,8 +157,8 @@ class UserQuestionService:
     ) -> QuestionCallbackTokens:
         """Register opaque callback tokens for one question prompt.
 
-        Dispatches by active context: an active external Ghostty pending question
-        yields ``EXTERNAL_GHOSTTY`` tokens; otherwise the managed structured session
+        Dispatches by active context: an active external terminal pending question
+        yields ``EXTERNAL_TERMINAL`` tokens; otherwise the managed structured session
         state yields ``MANAGED`` tokens. Returns a non-tokenised bundle (legacy inline
         callback_data) when no callback registry or session id is available.
         """
@@ -168,7 +168,7 @@ class UserQuestionService:
         external_state = self._external_uq_state
         if external_state is not None:
             pending = external_state.get_active(prompt.tool_use_id)
-            if pending is not None and pending.user_id == user_id and isinstance(pending.target, ExternalGhosttyQuestionTarget):
+            if pending is not None and pending.user_id == user_id and isinstance(pending.target, ExternalTerminalQuestionTarget):
                 return await registry.register_question_tokens(
                     owner_user_id=user_id,
                     session_id=pending.session_id,
@@ -176,7 +176,7 @@ class UserQuestionService:
                     question_index=prompt.question_index,
                     option_count=len(prompt.options),
                     multi_select=prompt.multi_select,
-                    origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+                    origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
                 )
         session_id = await self._resolve_question_session_id(user_id=user_id, tool_use_id=prompt.tool_use_id)
         if session_id is None:
@@ -290,7 +290,7 @@ class UserQuestionService:
                     option_index=option_index,
                 )
                 if not toggled:
-                    # fail-closed on external Ghostty: no managed-terminal fallback
+                    # fail-closed on external terminal: no managed-terminal fallback
                     return False, text, None, None
 
                 selected_option_indexes = draft.selected_option_indexes_by_question.setdefault(question_index, set())
@@ -418,17 +418,17 @@ class UserQuestionService:
             # Resolve the managed structured-session pending question FIRST. When
             # the user has an active managed AskUserQuestion, a typed answer must
             # answer that managed question — never a simultaneously-live external
-            # Ghostty question. Previously the external probe ran first and, when
-            # exactly one external Ghostty question existed for the same user, it
+            # terminal question. Previously the external probe ran first and, when
+            # exactly one external terminal question existed for the same user, it
             # hijacked the answer to the external terminal, leaving the managed
             # session's permission request permanently unanswered (Claude blocked).
             state, prompts = await self._resolve_active_user_question_context(user_id=user_id)
             if not prompts:
-                # External Ghostty free-text routing (design §5): eligible only when
-                # there is exactly one active external Ghostty question AND no
+                # External terminal free-text routing (design §5): eligible only when
+                # there is exactly one active external terminal question AND no
                 # managed pending question. Ambiguous → reject and consume the
                 # message; never fall back to managed. ``answer`` is stripped only
-                # for the emptiness guard — the raw text is forwarded to Ghostty.
+                # for the emptiness guard — the raw text is forwarded to the terminal.
                 external_target = self._resolve_external_free_text_target(user_id=user_id)
                 if isinstance(external_target, ExternalQuestionPendingAmbiguous):
                     return False, "存在多个待处理的外部问题，请用按钮精确回答", None
@@ -640,29 +640,29 @@ class UserQuestionService:
                     prompts = self._extract_user_question_prompts_for_tool_use_id(state, tool_use_id=draft.tool_use_id)
         return state, prompts
 
-    # ─── external Ghostty dispatch (design §6 / §9 / §10) ─────────────
+    # ─── external terminal dispatch (design §6 / §9 / §10) ────────────
 
     def _external_pending_active(self, *, tool_use_id: str, user_id: int) -> bool:
         state = self._external_uq_state
         if state is None or not tool_use_id:
             return False
         snapshot = state.get_active(tool_use_id)
-        return snapshot is not None and snapshot.user_id == user_id and isinstance(snapshot.target, ExternalGhosttyQuestionTarget)
+        return snapshot is not None and snapshot.user_id == user_id and isinstance(snapshot.target, ExternalTerminalQuestionTarget)
 
     def _external_pending_prompts(self, *, tool_use_id: str, user_id: int) -> tuple[UserQuestionPrompt, ...] | None:
-        """Return the prompts of an active external Ghostty question (owner-checked).
+        """Return the prompts of an active external terminal question (owner-checked).
 
         The option/toggle/submit button paths first try the managed structured
-        session for prompts. For an external Ghostty session there is no managed
+        session for prompts. For an external terminal session there is no managed
         pending — ``_resolve_active_user_question_context`` returns empty prompts,
         so we fall back to the external pending stored at push time. Returns None
-        when no active external Ghostty question matches.
+        when no active external terminal question matches.
         """
         state = self._external_uq_state
         if state is None or not tool_use_id:
             return None
         snapshot = state.get_active(tool_use_id)
-        if snapshot is None or snapshot.user_id != user_id or not isinstance(snapshot.target, ExternalGhosttyQuestionTarget):
+        if snapshot is None or snapshot.user_id != user_id or not isinstance(snapshot.target, ExternalTerminalQuestionTarget):
             return None
         return snapshot.prompts
 
@@ -675,7 +675,7 @@ class UserQuestionService:
         if snapshot_pending is None:
             return None
         target = snapshot_pending.target
-        if not isinstance(target, ExternalGhosttyQuestionTarget):
+        if not isinstance(target, ExternalTerminalQuestionTarget):
             return None
         return ExternalUserQuestionContext(
             tool_use_id=tool_use_id,
@@ -692,7 +692,7 @@ class UserQuestionService:
         state = self._external_uq_state
         if state is None:
             return ExternalQuestionPendingNone()
-        return state.resolve_unique_active_for_user(user_id, kind="ghostty")
+        return state.resolve_unique_active_for_user(user_id, group="external_terminal")
 
     async def _apply_external_user_question_toggle(
         self,
@@ -703,7 +703,7 @@ class UserQuestionService:
         transport = self._external_question_transport
         state = self._external_uq_state
         if transport is None or state is None:
-            return False, "外部 Ghostty 问答功能未启用"
+            return False, "外部终端问答功能未启用"
         context = self._external_context(
             tool_use_id=prompt.tool_use_id,
             snapshot_pending=state.get_active(prompt.tool_use_id),
@@ -728,7 +728,7 @@ class UserQuestionService:
         transport = self._external_question_transport
         state = self._external_uq_state
         if transport is None or state is None:
-            return False, "外部 Ghostty 问答功能未启用"
+            return False, "外部终端问答功能未启用"
         context = self._external_context(
             tool_use_id=prompt.tool_use_id,
             snapshot_pending=state.get_active(prompt.tool_use_id),
@@ -760,7 +760,7 @@ class UserQuestionService:
         option_index: int | None = None,
         text: str | None = None,
     ) -> tuple[bool, str, UserQuestionPrompt | None]:
-        """Exactly-once external Ghostty question submit (design §9 / §10).
+        """Exactly-once external terminal question submit (design §9 / §10).
 
         Per-user lock already held by the caller; the transport acquires the
         per-session input lock internally. Final action sequence:
@@ -773,7 +773,7 @@ class UserQuestionService:
         transport = self._external_question_transport
         state = self._external_uq_state
         if transport is None or state is None:
-            return False, "外部 Ghostty 问答功能未启用", None
+            return False, "外部终端问答功能未启用", None
         context = self._external_context(
             tool_use_id=prompt.tool_use_id,
             snapshot_pending=state.get_active(prompt.tool_use_id),
@@ -813,7 +813,7 @@ class UserQuestionService:
             return False, result.message, None
         if result.status is ExternalQuestionActionStatus.INDETERMINATE:
             await self._invalidate_external_question_tokens(session_id=context.session_id, tool_use_id=prompt.tool_use_id)
-            return False, result.message or "Ghostty 操作结果不确定，请检查终端", None
+            return False, result.message or "终端操作结果不确定，请检查终端", None
 
         if not final:
             # Intermediate question: do not respond to the Hook permission.
@@ -951,7 +951,7 @@ class UserQuestionService:
         return True, ""
 
     async def _approve_external_pending_permission(self, *, tool_use_id: str) -> tuple[bool, str]:
-        """Allow exactly once for an external Ghostty session's final question.
+        """Allow exactly once for an external terminal session's final question.
 
         External sessions carry no managed ``pending_permission`` entry, so the
         managed approve helper would silently skip the Hook call (it treats a

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from app.domain.external_terminal_models import ExternalTerminal, TerminalKind
     from app.domain.models import CLIEvent, ExecutionTask
     from app.domain.session_models import SessionEvent, SessionPhase, SessionState
     from app.domain.user_question_models import ExternalQuestionActionResult, ExternalUserQuestionContext
@@ -121,8 +122,57 @@ class ClaudeUserQuestionTransportProtocol(Protocol):
 
 
 @runtime_checkable
+class ExternalTerminalBackendProtocol(Protocol):
+    """一个外部终端模拟器（Ghostty / kitty）的输入注入能力。
+
+    后端只负责"在给定 terminal_id 上做事"，不做所有权、绑定代际或进程校验：
+    那些由 ``ExternalSessionInputService`` 统一负责。所有方法都返回
+    ``TerminalOutcome`` 常量字符串而不是抛异常，让服务端可以区分可重试的
+    预检失败与不可重试的 INDETERMINATE。
+
+    设计：``docs/specs/2026-10-29-external-kitty-input-design.md`` §2。
+    """
+
+    kind: TerminalKind
+
+    def is_available(self) -> bool: ...
+
+    async def list_terminals(self) -> tuple[list[ExternalTerminal] | None, str | None]: ...
+
+    async def validate_terminal(self, terminal_id: str) -> tuple[bool, ExternalTerminal | None, str | None]: ...
+
+    async def inject_text(self, terminal_id: str, text: str) -> str: ...
+
+    async def select_user_question_option(
+        self,
+        terminal_id: str,
+        *,
+        option_count: int,
+        option_index: int,
+        submit_after: bool,
+    ) -> str: ...
+
+    async def answer_user_question_with_text(
+        self,
+        terminal_id: str,
+        *,
+        option_count: int,
+        text: str,
+        submit_after: bool,
+    ) -> str: ...
+
+    async def advance_user_question_after_multi_select(
+        self,
+        terminal_id: str,
+        *,
+        option_count: int,
+        final_question: bool,
+    ) -> str: ...
+
+
+@runtime_checkable
 class ExternalClaudeUserQuestionTransportProtocol(Protocol):
-    """External Ghostty AskUserQuestion 的显式 target 操作能力。"""
+    """外部终端 AskUserQuestion 的显式 target 操作能力。"""
 
     async def select_option(
         self,

@@ -10,7 +10,7 @@ matching pending question and its opaque callback tokens:
     | reaper manual_unbind/pid_dead   | invalidate_session       | invalidate_session  |
     | reaper idle_ttl_expired   | (kept by design)               | (kept by design)    |
     | rebind_aba                | invalidate_stale_bindings       | invalidate_session  |
-    | re-pair consume_pair_token| invalidate_ghostty_target      | invalidate_session  |
+    | re-pair consume_pair_token| invalidate_terminal_target      | invalidate_session  |
 
 These tests verify that after each teardown the pending question is gone
 (``get_active`` is None) and the registry token no longer resolves
@@ -27,10 +27,10 @@ from pathlib import Path
 import pytest
 
 from app.adapters.storage.file_session_store import FileSessionStore
-from app.domain.external_session_models import ExternalBinding, GhosttyInputTarget
+from app.domain.external_session_models import ExternalBinding, ExternalTerminalTarget
 from app.domain.models import utc_now
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
+    ExternalTerminalQuestionTarget,
     UserQuestionOption,
     UserQuestionPrompt,
 )
@@ -68,7 +68,8 @@ def _binding(session_id: str, binding_id: str, *, paired: bool = True) -> Extern
         tty="/dev/ttys005",
     )
     if paired:
-        binding.ghostty_target = GhosttyInputTarget(
+        binding.terminal_target = ExternalTerminalTarget(
+            kind="ghostty",
             terminal_id="term-1",
             paired_tty="/dev/ttys005",
             paired_at=utc_now(),
@@ -80,11 +81,12 @@ def _binding(session_id: str, binding_id: str, *, paired: bool = True) -> Extern
 
 
 def _pending(session_id: str, binding_id: str, tool_use_id: str = "tuid-1") -> PendingExternalUserQuestion:
-    target = ExternalGhosttyQuestionTarget(
+    target = ExternalTerminalQuestionTarget(
         binding_id=binding_id,
         terminal_id="term-1",
         paired_tty="/dev/ttys005",
         paired_at=utc_now(),
+        kind="ghostty",
     )
     return PendingExternalUserQuestion(
         tool_use_id=tool_use_id,
@@ -116,7 +118,7 @@ async def _register_token(
         question_index=0,
         option_count=1,
         multi_select=False,
-        origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+        origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
     )
     return tokens.select_tokens[0]
 
@@ -149,7 +151,7 @@ class _Harness:
             enabled=True,
             binding_store=self.binding_store,
             session_store=self.session_store,
-            ghostty_adapter=self.adapter,  # type: ignore[arg-type]
+            backends={"ghostty": self.adapter},
             process_probe=self.probe,  # type: ignore[arg-type]
             pairing_registry=self.pairing,
             input_mode_store=self.mode_store,

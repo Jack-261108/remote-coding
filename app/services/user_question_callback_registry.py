@@ -19,7 +19,7 @@ class UserQuestionCallbackAction(StrEnum):
 
 class UserQuestionCallbackOrigin(StrEnum):
     MANAGED = "managed"
-    EXTERNAL_GHOSTTY = "external_ghostty"
+    EXTERNAL_TERMINAL = "external_terminal"
     EXTERNAL_TMUX = "external_tmux"
 
 

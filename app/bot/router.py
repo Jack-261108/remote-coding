@@ -139,13 +139,17 @@ class ExternalInputTargetActiveFilter(BaseFilter):
 
 
 class ExternalQuestionActiveFilter(BaseFilter):
-    """Match plain text only when there is exactly one active external Ghostty
+    """Match plain text only when there is at least one active external Ghostty
     question AND no managed pending question.
 
     Routing here (before the ordinary external/text routers) lets the user
     answer a Ghostty ``AskUserQuestion`` by typing free text as ``Other``.
-    Managed pending questions are checked first so this never hijacks a managed
-    tmux session. ``True`` consumes the message; ``False`` lets it fall through.
+    An ambiguous state (several active questions) also passes: the handler
+    re-resolves and tells the user to answer via buttons. Returning False on
+    ambiguity would let the text fall through to the external-terminal router
+    and be injected into a terminal that is waiting on a question. Managed
+    pending questions are checked first so this never hijacks a managed tmux
+    session. ``True`` consumes the message; ``False`` lets it fall through.
     """
 
     def __init__(
@@ -167,8 +171,8 @@ class ExternalQuestionActiveFilter(BaseFilter):
         managed_pending = await self._task_service.get_pending_user_questions(user_id)
         if managed_pending:
             return False
-        resolution = self._external_uq_state.resolve_unique_active_for_user(user_id, kind="ghostty")
-        return isinstance(resolution, ExternalQuestionPendingUnique)
+        resolution = self._external_uq_state.resolve_unique_active_for_user(user_id, group="external_terminal")
+        return isinstance(resolution, (ExternalQuestionPendingUnique, ExternalQuestionPendingAmbiguous))
 
 
 async def answer_external_user_question_text(
@@ -208,7 +212,7 @@ async def answer_external_user_question_text(
     if await task_service.get_pending_user_questions(user_id):
         await message.answer("已有待处理的选择题，请先用其按钮回答")
         return
-    resolution = external_uq_state.resolve_unique_active_for_user(user_id, kind="ghostty")
+    resolution = external_uq_state.resolve_unique_active_for_user(user_id, group="external_terminal")
     if isinstance(resolution, ExternalQuestionPendingAmbiguous):
         await message.answer("存在多个待处理的外部问题，请用按钮精确回答")
         return
@@ -324,14 +328,14 @@ def _register_optional_handlers(
         )
         router.include_router(session_action_router)
 
-        # Pairing callbacks live on a separate router with their own ``ghpair`` prefix; sharing
-        # ``sess`` middleware would reject ghpair buttons (and vice versa), since
+        # Pairing callbacks live on a separate router with their own ``tpair`` prefix; sharing
+        # ``sess`` middleware would reject tpair buttons (and vice versa), since
         # CallbackValidatorMiddleware answers+consumes any callback whose prefix does not match.
         if external_session_input_service is not None:
-            ghpair_router = Router()
-            ghpair_router.callback_query.middleware(CallbackValidatorMiddleware(expected_parts=2, prefix="ghpair"))
-            register_pair_consume_handler(ghpair_router, input_service=external_session_input_service, session_service=session_service)
-            router.include_router(ghpair_router)
+            tpair_router = Router()
+            tpair_router.callback_query.middleware(CallbackValidatorMiddleware(expected_parts=2, prefix="tpair"))
+            register_pair_consume_handler(tpair_router, input_service=external_session_input_service, session_service=session_service)
+            router.include_router(tpair_router)
 
             # Free-text answer router for external Ghostty AskUserQuestion.
             # Registered BEFORE the ordinary external text router so a typed answer

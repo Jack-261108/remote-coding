@@ -38,15 +38,15 @@ EXTERNAL_INPUT_LEFT_MARK = "✅ 已退出外部输入模式"
 
 def _pair_outcome_text(outcome: PairOutcome) -> str:
     return {
-        PairOutcome.ACTIVATED: "已进入外部输入模式，普通文本将注入已配对的 Ghostty 终端。",
-        PairOutcome.NEEDS_PAIRING: "需要配对 Ghostty 终端。",
+        PairOutcome.ACTIVATED: "已进入外部输入模式，普通文本将注入已配对的终端。",
+        PairOutcome.NEEDS_PAIRING: "需要配对终端。",
         PairOutcome.NOT_OWNER: "你不是该会话的绑定者。",
         PairOutcome.BINDING_STALE: "绑定已变更，请重新操作。",
         PairOutcome.SESSION_ENDED: "会话已结束。",
         PairOutcome.PROCESS_INVALID: "无法验证前台 Claude 进程。",
         PairOutcome.TERMINAL_INVALID: "配对的终端已失效。",
-        PairOutcome.ADAPTER_UNAVAILABLE: "Ghostty 适配器不可用（仅 macOS + 已授权自动化）。",
-        PairOutcome.NO_TERMINALS: "未发现可用的 Ghostty 终端。",
+        PairOutcome.ADAPTER_UNAVAILABLE: "终端适配器不可用（请检查终端远程控制配置）。",
+        PairOutcome.NO_TERMINALS: "未发现可用的终端。",
         PairOutcome.TOKEN_INVALID: "配对令牌无效或已过期。",
         PairOutcome.TOKEN_UNAUTHORIZED: "配对令牌不属于你。",
         PairOutcome.PAIRING_NOT_ENABLED: "外部输入功能未启用。",
@@ -54,11 +54,22 @@ def _pair_outcome_text(outcome: PairOutcome) -> str:
     }.get(outcome, f"操作失败：{outcome.value}")
 
 
-def _pair_terminal_label(*, terminal_id: str, name: str | None, cwd: str | None) -> str:
-    """Build a compact but distinguishable explicit-pairing label."""
+def _pair_terminal_label(
+    *,
+    terminal_id: str,
+    name: str | None,
+    cwd: str | None,
+    pid_match: bool = False,
+) -> str:
+    """Build a compact but distinguishable explicit-pairing label.
+
+    ``pid_match`` marks a candidate whose window hosts the bound Claude PID.
+    It is a hint that helps the owner pick correctly; it never selects.
+    """
     name_label = truncate_text((name or "未命名").strip() or "未命名", 22)
     cwd_label = truncate_text(short_cwd(cwd or "", fallback="cwd 未知"), 22)
-    return f"配对: {name_label} · {cwd_label} · {terminal_id[-8:]}"
+    suffix = " · PID✓" if pid_match else ""
+    return f"配对: {name_label} · {cwd_label} · {terminal_id[-8:]}{suffix}"
 
 
 async def _resolve_terminal_id_prefix(
@@ -157,7 +168,7 @@ def register_session_action_handlers(
             await _show_selection_result(detail_text + f"\n\n⚠️ {_pair_outcome_text(outcome)}", reply_markup=keyboard)
 
         if validation.action == "unbind" and external_session_input_service is not None:
-            # Bound + owner: offer Ghostty input activation/pairing in addition to unbind.
+            # Bound + owner: offer external input activation/pairing in addition to unbind.
             outcome = await external_session_input_service.activate_select(user_id=user_id, session_id=session_id)
             if outcome == PairOutcome.ACTIVATED:
                 await callback.answer()
@@ -178,6 +189,7 @@ def register_session_action_handlers(
                             user_id=user_id,
                             session_id=session_id,
                             expected_binding_id=candidates.binding_id,
+                            terminal_kind=terminal.kind,
                             terminal_id=terminal.terminal_id,
                         )
                         if token is None:
@@ -186,12 +198,15 @@ def register_session_action_handlers(
                             terminal_id=terminal.terminal_id,
                             name=terminal.name,
                             cwd=terminal.cwd,
+                            pid_match=candidates.binding_pid is not None
+                            and candidates.binding_pid > 0
+                            and (candidates.binding_pid == terminal.pid or candidates.binding_pid in terminal.foreground_pids),
                         )
-                        buttons.append([InlineKeyboardButton(text=label, callback_data=f"ghpair:{token}")])
+                        buttons.append([InlineKeyboardButton(text=label, callback_data=f"tpair:{token}")])
                     buttons.append([_unbind_button(callback_token)])
                     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
                     await callback.answer()
-                    await _show_selection_result(detail_text + "\n\n🔌 选择要配对的 Ghostty 终端：", reply_markup=keyboard)
+                    await _show_selection_result(detail_text + "\n\n🔌 选择要配对的终端：", reply_markup=keyboard)
                     return
                 await _show_pair_failure(pair_outcome)
                 return
@@ -321,9 +336,9 @@ def register_pair_consume_handler(
     input_service: ExternalSessionInputService,
     session_service: SessionService | None = None,
 ) -> None:
-    """Consume a ``ghpair:<token>`` callback and finalise Ghostty pairing."""
+    """Consume a ``tpair:<token>`` callback and finalise terminal pairing."""
 
-    @router.callback_query(F.data.startswith("ghpair:"))
+    @router.callback_query(F.data.startswith("tpair:"))
     async def handle_pair_consume(callback: CallbackQuery, callback_parts: tuple[str, ...]) -> None:
         if len(callback_parts) < 2 or not callback_parts[1]:
             await callback.answer("无效的配对回调")
@@ -358,7 +373,7 @@ def register_external_text_handlers(
     input_service: ExternalSessionInputService,
     target_filter: BaseFilter,
 ) -> None:
-    """Inject plain Telegram text into the active external Ghostty session."""
+    """Inject plain Telegram text into the active external terminal session."""
 
     @router.message(F.text, target_filter)
     async def handle_external_text(message: Message) -> None:
@@ -377,13 +392,13 @@ def register_external_text_handlers(
         if outcome == SendOutcome.NO_TARGET:
             return
         text_map = {
-            SendOutcome.NOT_PAIRED: "❌ 当前会话未配对 Ghostty 终端。",
+            SendOutcome.NOT_PAIRED: "❌ 当前会话未配对终端。",
             SendOutcome.NOT_OWNER: "❌ 你不是该会话的绑定者。",
             SendOutcome.BINDING_STALE: "❌ 绑定已变更，请重新选择。",
             SendOutcome.SESSION_ENDED: "❌ 会话已结束。",
             SendOutcome.PROCESS_INVALID: "❌ 无法验证前台 Claude 进程。",
             SendOutcome.TERMINAL_INVALID: "❌ 配对的终端已失效。",
-            SendOutcome.ADAPTER_UNAVAILABLE: "❌ Ghostty 适配器不可用。",
+            SendOutcome.ADAPTER_UNAVAILABLE: "❌ 终端适配器不可用。",
             SendOutcome.QUEUE_FULL: "❌ 输入队列已满。",
             SendOutcome.INJECTION_FAILED: "❌ 注入失败。",
             SendOutcome.INJECTION_INDETERMINATE: "⚠️ 注入结果不确定。",

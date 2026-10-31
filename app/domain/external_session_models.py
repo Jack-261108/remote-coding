@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from app.domain.external_terminal_models import TerminalKind
+
 
 class SessionOrigin(StrEnum):
     TMUX = "tmux"
@@ -34,18 +36,21 @@ class UnboundExternalSession:
 
 
 @dataclass
-class GhosttyInputTarget:
-    """Stable Ghostty terminal selected for injecting input to a bound session.
+class ExternalTerminalTarget:
+    """Stable terminal selected for injecting input to a bound session.
 
-    ``terminal_id`` is the only addressing field — Ghostty's stable surface
-    UUID. ``paired_tty`` is the trust anchor used on every send to verify the
-    bound Claude process still runs in the same PTY as at pairing time.
+    ``terminal_id`` is the only addressing field — a Ghostty surface UUID or a
+    kitty window id as a decimal string. ``kind`` disambiguates the backend
+    because ids are only unique within one terminal emulator.
+    ``paired_tty`` is the trust anchor used on every send to verify the bound
+    Claude process still runs in the same PTY as at pairing time.
     ``binding_id`` records the binding generation at pairing time and acts as
     an ABA barrier: an unbind+rebind that produced a new binding_id invalidates
     a previously-paired target. ``name``/``cwd`` snapshots are display-only and
     must never participate in addressing.
     """
 
+    kind: TerminalKind
     terminal_id: str
     paired_tty: str
     paired_at: datetime
@@ -70,7 +75,7 @@ class ExternalBinding:
     last_pushed_reply_turn_id: str | None = None
     reply_cursor_initialized: bool = False
     tty: str | None = None
-    ghostty_target: GhosttyInputTarget | None = None
+    terminal_target: ExternalTerminalTarget | None = None
 
     def __post_init__(self, last_activity_at_init: datetime | None) -> None:
         # Default activity timestamp to bind time so existing callers that don't

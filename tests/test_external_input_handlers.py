@@ -2,7 +2,7 @@
 
 Covers the Telegram handlers registered in ``app/bot/handlers/session_actions.py``
 and ``app/bot/handlers/external_session.py`` and the router wiring in
-``app/bot/router.py``: ``ghpair:`` pairing consume, ``sess:leave`` exit, the
+``app/bot/router.py``: ``tpair:`` pairing consume, ``sess:leave`` exit, the
 external text router (active-target filter match / fall-through and the
 SendOutcome -> reply mapping), and ``/external leave``.
 
@@ -129,7 +129,7 @@ def test_pair_terminal_label_disambiguates_name_cwd_and_uuid() -> None:
     )
 
 
-# ── ghpair consume ──────────────────────────────────────────────────────────
+# ── tpair consume ──────────────────────────────────────────────────────────
 
 
 class TestPairConsumeHandler:
@@ -141,6 +141,7 @@ class TestPairConsumeHandler:
             user_id=42,
             session_id=binding.session_id,
             expected_binding_id=binding.binding_id,
+            terminal_kind="ghostty",
             terminal_id="term-1",
         )
         assert token is not None
@@ -148,7 +149,7 @@ class TestPairConsumeHandler:
         router = Router()
         register_pair_consume_handler(router, input_service=service)
         msg = _message("")
-        cb = _callback(f"ghpair:{token}", message=msg)
+        cb = _callback(f"tpair:{token}", message=msg)
         await _dispatch_cb(router, 0, cb)
         # 配对成功后必须清掉消息上残留的配对/取消绑定按钮（空键盘而非 None）
         msg.edit_text.assert_awaited_once_with("✅ 配对成功，已进入外部输入模式。", reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
@@ -163,6 +164,7 @@ class TestPairConsumeHandler:
             user_id=42,
             session_id=binding.session_id,
             expected_binding_id=binding.binding_id,
+            terminal_kind="ghostty",
             terminal_id="term-1",
         )
         assert token is not None
@@ -170,7 +172,7 @@ class TestPairConsumeHandler:
         router = Router()
         register_pair_consume_handler(router, input_service=service, session_service=_session_service_stub(chat_active=True))
         msg = _message("")
-        cb = _callback(f"ghpair:{token}", message=msg)
+        cb = _callback(f"tpair:{token}", message=msg)
         await _dispatch_cb(router, 0, cb)
         assert msg.edit_text.await_count == 1
         reply = msg.edit_text.await_args.args[0]
@@ -190,6 +192,7 @@ class TestPairConsumeHandler:
             user_id=42,
             session_id=binding.session_id,
             expected_binding_id=binding.binding_id,
+            terminal_kind="ghostty",
             terminal_id="term-1",
         )
         assert token is not None
@@ -199,7 +202,7 @@ class TestPairConsumeHandler:
             router, input_service=service, session_service=_session_service_stub(chat_active=True, terminal_mode=True)
         )
         msg = _message("")
-        cb = _callback(f"ghpair:{token}", message=msg)
+        cb = _callback(f"tpair:{token}", message=msg)
         await _dispatch_cb(router, 0, cb)
         assert msg.edit_text.await_count == 1
         reply = msg.edit_text.await_args.args[0]
@@ -216,7 +219,7 @@ class TestPairConsumeHandler:
         router = Router()
         register_pair_consume_handler(router, input_service=service)
         msg = _message("")
-        cb = _callback("ghpair:does-not-exist", message=msg)
+        cb = _callback("tpair:does-not-exist", message=msg)
         await _dispatch_cb(router, 0, cb)
         msg.edit_text.assert_not_awaited()
         msg.answer.assert_awaited_once()

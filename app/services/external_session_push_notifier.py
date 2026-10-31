@@ -222,7 +222,7 @@ class ExternalSessionPushNotifier:
         session_id: str,
         prompts: tuple[UserQuestionPrompt, ...],
         interactive: bool = False,
-        origin: UserQuestionCallbackOrigin = UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+        origin: UserQuestionCallbackOrigin = UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
     ) -> bool:
         """Send notification showing AskUserQuestion options.
 
@@ -236,7 +236,7 @@ class ExternalSessionPushNotifier:
             return False
         # For interactive mode, we only show the first unanswered prompt with buttons
         prompt = prompts[0]
-        prefix = "ask" if origin is UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY else "ext_uq"
+        prefix = "ask" if origin is UserQuestionCallbackOrigin.EXTERNAL_TERMINAL else "ext_uq"
         lines = format_external_tmux_question_text(prompt, session_id).splitlines()
 
         if not interactive or not prompt.options:
@@ -260,8 +260,8 @@ class ExternalSessionPushNotifier:
 
         lines.append("")
         lines.append("👇 点击按钮选择；可直接回复文字作为 Other/自由文本")
-        if origin is UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY:
-            lines.append("作答期间请勿在 Ghostty 本地操作")
+        if origin is UserQuestionCallbackOrigin.EXTERNAL_TERMINAL:
+            lines.append("作答期间请勿在本地终端操作")
         text = "\n".join(lines).rstrip()
         buttons: list[list[Button]] = []
         # The legacy tmux PTY injector (``inject_option_selection``) only models a
@@ -269,7 +269,7 @@ class ExternalSessionPushNotifier:
         # multi-select toggle/submit semantics. Render multi-select prompts as
         # one-shot single-choice buttons for tmux so every emitted button carries
         # a resolveable SELECT token; Ghostty keeps its native toggle + submit UX.
-        supports_multi_select = origin is UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY
+        supports_multi_select = origin is UserQuestionCallbackOrigin.EXTERNAL_TERMINAL
         if prompt.multi_select and supports_multi_select:
             for index, option in enumerate(prompt.options):
                 token = tokens.toggle_tokens[index] if index < len(tokens.toggle_tokens) else None
@@ -297,7 +297,7 @@ class ExternalSessionPushNotifier:
         # The legacy tmux injector only models single-choice keystrokes; render
         # even a multi_select prompt as single-choice (registering select_tokens,
         # not toggle/submit). Ghostty keeps the native multi-select registration.
-        supports_multi_select = origin is UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY
+        supports_multi_select = origin is UserQuestionCallbackOrigin.EXTERNAL_TERMINAL
         return await registry.register_question_tokens(
             owner_user_id=user_id,
             session_id=session_id,

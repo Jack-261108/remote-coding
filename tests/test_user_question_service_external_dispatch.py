@@ -19,9 +19,9 @@ from app.adapters.storage.file_session_store import FileSessionStore
 from app.adapters.storage.memory import MemoryTaskStore
 from app.domain.session_models import PendingPermission, SessionPhase, ToolCallRecord, ToolStatus
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
     ExternalQuestionActionResult,
     ExternalQuestionActionStatus,
+    ExternalTerminalQuestionTarget,
     ExternalUserQuestionContext,
     ExternalUserQuestionPhase,
     UserQuestionOption,
@@ -47,11 +47,12 @@ def _pending(tool_use_id: str, session_id: str, prompts: tuple[UserQuestionPromp
         session_id=session_id,
         user_id=1,
         prompts=prompts,
-        target=ExternalGhosttyQuestionTarget(
+        target=ExternalTerminalQuestionTarget(
             binding_id="bind-1",
             terminal_id="term-1",
             paired_tty="/dev/ttys005",
             paired_at=datetime(2024, 1, 1, tzinfo=UTC),
+            kind="ghostty",
         ),
     )
 
@@ -229,7 +230,7 @@ async def test_external_single_select_final_calls_transport_allow_and_completes(
         question_index=0,
         option_count=2,
         multi_select=False,
-        origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+        origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
     )
     transport = _RecordingTransport(state)
     service.configure_external(external_uq_state=state, external_question_transport=transport, callback_registry=registry)
@@ -670,7 +671,7 @@ async def test_external_final_indeterminate_transport_invalidates_tokens(tmp_pat
         question_index=0,
         option_count=2,
         multi_select=False,
-        origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+        origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
     )
     transport = _RecordingTransport(state, result=ExternalQuestionActionStatus.INDETERMINATE)
     service.configure_external(external_uq_state=state, external_question_transport=transport, callback_registry=registry)

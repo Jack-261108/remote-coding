@@ -28,7 +28,7 @@ from app.domain.session_models import (
     SessionState,
 )
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
+    ExternalTerminalQuestionTarget,
     ExternalTmuxQuestionTarget,
     UserQuestionPrompt,
     extract_user_question_prompts,
@@ -942,8 +942,8 @@ class HookHandlingMixin(AppContainerBase):
             return
         if event.expects_response:
             # AskUserQuestion: route to an interactive external question card
-            # (Ghostty or legacy tmux) when a target is available; otherwise fall
-            # through to the generic permission confirmation card.
+            # (external terminal or legacy tmux) when a target is available;
+            # otherwise fall through to the generic permission confirmation card.
             if event.tool == "AskUserQuestion":
                 prompts = extract_user_question_prompts(
                     tool_use_id=event.tool_use_id or "",
@@ -951,9 +951,9 @@ class HookHandlingMixin(AppContainerBase):
                     tool_input=event.tool_input,
                 )
                 if prompts and hasattr(self, "external_uq_state"):
-                    # Ghostty-bound session: inject via the verified transport.
-                    ghostty_handled = await self._try_ghostty_user_question(event=event, user_id=user_id, prompts=prompts)
-                    if ghostty_handled:
+                    # Terminal-bound session: inject via the verified transport.
+                    terminal_handled = await self._try_external_terminal_user_question(event=event, user_id=user_id, prompts=prompts)
+                    if terminal_handled:
                         return
 
                     # Legacy tmux: PTY injection when a pane is reachable for the PID.
@@ -1008,27 +1008,28 @@ class HookHandlingMixin(AppContainerBase):
         elif event.event == "Stop":
             await self._push_bound_assistant_replies(event, user_id)
 
-    async def _try_ghostty_user_question(
+    async def _try_external_terminal_user_question(
         self,
         *,
         event: HookEvent,
         user_id: int,
         prompts: tuple[UserQuestionPrompt, ...],
     ) -> bool:
-        """Route an AskUserQuestion to a bound, paired Ghostty session.
+        """Route an AskUserQuestion to a bound, paired external terminal session.
 
-        Returns True when a Ghostty target exists for the bound session and the
-        interactive question card has been pushed (the Hook permission is held
-        until the user answers and the transport reports completion). Returns
-        False to let the caller fall through to the tmux / generic card.
+        Returns True when a terminal target (Ghostty surface or kitty window)
+        exists for the bound session and the interactive question card has been
+        pushed (the Hook permission is held until the user answers and the
+        transport reports completion). Returns False to let the caller fall
+        through to the tmux / generic card.
         """
         if not hasattr(self, "external_binding_store"):
             return False
         binding = self.external_binding_store.get_binding(event.session_id)
         if binding is None or binding.ended_at is not None or binding.user_id != user_id:
             return False
-        ghostty_target = binding.ghostty_target
-        if ghostty_target is None:
+        terminal_target = binding.terminal_target
+        if terminal_target is None:
             return False
         from app.services.external_user_question_state import (
             ExternalUserQuestionState,
@@ -1036,11 +1037,12 @@ class HookHandlingMixin(AppContainerBase):
         )
 
         state: ExternalUserQuestionState = self.external_uq_state
-        question_target = ExternalGhosttyQuestionTarget(
-            binding_id=ghostty_target.binding_id,
-            terminal_id=ghostty_target.terminal_id,
-            paired_tty=ghostty_target.paired_tty,
-            paired_at=ghostty_target.paired_at,
+        question_target = ExternalTerminalQuestionTarget(
+            binding_id=terminal_target.binding_id,
+            terminal_id=terminal_target.terminal_id,
+            paired_tty=terminal_target.paired_tty,
+            paired_at=terminal_target.paired_at,
+            kind=terminal_target.kind,
         )
         pending = PendingExternalUserQuestion(
             tool_use_id=event.tool_use_id or "",
@@ -1055,7 +1057,7 @@ class HookHandlingMixin(AppContainerBase):
             session_id=event.session_id,
             prompts=prompts,
             interactive=True,
-            origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+            origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
         )
         return True
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
+    ExternalTerminalQuestionTarget,
     ExternalTmuxQuestionTarget,
     ExternalUserQuestionPhase,
     UserQuestionPrompt,
@@ -28,12 +28,13 @@ def _prompt(tool_use_id: str) -> tuple[UserQuestionPrompt, ...]:
     )
 
 
-def _ghostty_target(*, paired_at: datetime | None = None) -> ExternalGhosttyQuestionTarget:
-    return ExternalGhosttyQuestionTarget(
+def _terminal_target(*, paired_at: datetime | None = None) -> ExternalTerminalQuestionTarget:
+    return ExternalTerminalQuestionTarget(
         binding_id="binding-1",
         terminal_id="terminal-1",
         paired_tty="/dev/ttys005",
         paired_at=paired_at or datetime.now(UTC),
+        kind="ghostty",
     )
 
 
@@ -49,7 +50,7 @@ def _pending(
         session_id=session_id,
         user_id=user_id,
         prompts=_prompt(tool_use_id),
-        target=target or _ghostty_target(),
+        target=target or _terminal_target(),
     )
 
 
@@ -85,13 +86,13 @@ def test_resolve_unique_active_for_user_is_fail_closed_on_ambiguity() -> None:
     assert ambiguous.count == 2
 
 
-def test_resolve_unique_active_filters_by_kind_across_mixed_targets() -> None:
-    """A user with one ghostty and one tmux pending is not ambiguous per-kind.
+def test_resolve_unique_active_filters_by_group_across_mixed_targets() -> None:
+    """A user with one terminal and one tmux pending is not ambiguous per-group.
 
-    ``resolve_unique_active_for_user(kind="ghostty")`` must return the single
-    ghostty question (not an ambiguous count of 2), so the free-text router —
-    which always queries ``kind="ghostty"`` — cannot be tripped by a concurrent
-    external tmux question on the same user.
+    ``resolve_unique_active_for_user(group="external_terminal")`` must return
+    the single terminal question (not an ambiguous count of 2), so the
+    free-text router — which always queries ``group="external_terminal"`` —
+    cannot be tripped by a concurrent external tmux question on the same user.
     """
     state = ExternalUserQuestionState()
     state.store(_pending("tool-ghostty"))
@@ -107,24 +108,24 @@ def test_resolve_unique_active_filters_by_kind_across_mixed_targets() -> None:
         )
     )
 
-    ghostty = state.resolve_unique_active_for_user(42, kind="ghostty")
-    assert isinstance(ghostty, ExternalQuestionPendingUnique)
-    assert ghostty.pending.tool_use_id == "tool-ghostty"
+    terminal = state.resolve_unique_active_for_user(42, group="external_terminal")
+    assert isinstance(terminal, ExternalQuestionPendingUnique)
+    assert terminal.pending.tool_use_id == "tool-ghostty"
 
-    tmux = state.resolve_unique_active_for_user(42, kind="tmux")
+    tmux = state.resolve_unique_active_for_user(42, group="tmux")
     assert isinstance(tmux, ExternalQuestionPendingUnique)
     assert tmux.pending.tool_use_id == "tool-tmux"
 
 
 def test_phase_transitions_require_expected_target_and_order() -> None:
     state = ExternalUserQuestionState()
-    target = _ghostty_target()
+    target = _terminal_target()
     state.store(_pending("tool-1", target=target))
 
     assert not state.mark_completed(tool_use_id="tool-1", expected_target=target)
     assert not state.mark_terminal_action_applied(
         tool_use_id="tool-1",
-        expected_target=_ghostty_target(paired_at=target.paired_at + timedelta(seconds=1)),
+        expected_target=_terminal_target(paired_at=target.paired_at + timedelta(seconds=1)),
     )
     assert state.mark_terminal_action_applied(tool_use_id="tool-1", expected_target=target)
     assert state.get_active("tool-1") is None
@@ -134,7 +135,7 @@ def test_phase_transitions_require_expected_target_and_order() -> None:
 
 def test_mark_indeterminate_blocks_active_question() -> None:
     state = ExternalUserQuestionState()
-    target = _ghostty_target()
+    target = _terminal_target()
     state.store(_pending("tool-1", target=target))
 
     assert state.mark_indeterminate(tool_use_id="tool-1", expected_target=target, reason="timeout")
@@ -155,7 +156,7 @@ def test_mark_indeterminate_from_terminal_action_applied() -> None:
     and covers the transition at the state-API layer, independent of transport.
     """
     state = ExternalUserQuestionState()
-    target = _ghostty_target()
+    target = _terminal_target()
     state.store(_pending("tool-1", target=target))
     assert state.mark_terminal_action_applied(tool_use_id="tool-1", expected_target=target)
 
@@ -176,13 +177,14 @@ def test_mark_indeterminate_from_terminal_action_applied() -> None:
 def test_repair_with_same_terminal_and_tty_invalidates_old_paired_at() -> None:
     state = ExternalUserQuestionState()
     paired_at = datetime.now(UTC)
-    target = _ghostty_target(paired_at=paired_at)
+    target = _terminal_target(paired_at=paired_at)
     state.store(_pending("tool-1", target=target))
 
     assert (
-        state.invalidate_ghostty_target(
+        state.invalidate_terminal_target(
             session_id="session-1",
             binding_id="binding-1",
+            kind="ghostty",
             terminal_id="terminal-1",
             paired_tty="/dev/ttys005",
             paired_at=paired_at + timedelta(seconds=1),
@@ -191,9 +193,10 @@ def test_repair_with_same_terminal_and_tty_invalidates_old_paired_at() -> None:
     )
     assert state.get("tool-1") is not None
     assert (
-        state.invalidate_ghostty_target(
+        state.invalidate_terminal_target(
             session_id="session-1",
             binding_id="binding-1",
+            kind="ghostty",
             terminal_id="terminal-1",
             paired_tty="/dev/ttys005",
             paired_at=paired_at,
@@ -212,7 +215,7 @@ def test_ttl_prunes_active_but_keeps_recent_terminal_tombstone() -> None:
         wall_clock=lambda: wall,
         monotonic_clock=lambda: mono,
     )
-    target = _ghostty_target(paired_at=now)
+    target = _terminal_target(paired_at=now)
     state.store(_pending("active", target=target))
     state.store(_pending("done", target=target))
     assert state.mark_terminal_action_applied(tool_use_id="done", expected_target=target)
@@ -242,7 +245,7 @@ def test_ttl_ignores_wall_clock_jumps_and_uses_monotonic_only() -> None:
         wall_clock=lambda: wall,
         monotonic_clock=lambda: mono,
     )
-    target = _ghostty_target(paired_at=wall)
+    target = _terminal_target(paired_at=wall)
     state.store(_pending("fresh", target=target))
 
     # Wall clock yanked back a year — must not prematurely expire a fresh record.
@@ -261,8 +264,8 @@ def test_ttl_ignores_wall_clock_jumps_and_uses_monotonic_only() -> None:
     assert [item.tool_use_id for item in state.prune_stale()] == ["fresh"]
 
     state = ExternalUserQuestionState()
-    old = _ghostty_target()
-    new = _ghostty_target(paired_at=old.paired_at + timedelta(seconds=1))
+    old = _terminal_target()
+    new = _terminal_target(paired_at=old.paired_at + timedelta(seconds=1))
     state.store(_pending("tool-1", target=new))
 
     assert state.remove_if_matches(tool_use_id="tool-1", session_id="session-1", expected_target=old) is None

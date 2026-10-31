@@ -7,7 +7,10 @@ managed chat or external text routers). It matches only when:
 * there is a non-empty, non-slash text message;
 * the user has NO managed pending question (so managed tmux questions are
   never hijacked by this earlier router — the chief regression risk);
-* there is exactly one active Ghostty external question for the user.
+* there is at least one active Ghostty external question for the user — an
+  ambiguous state also passes so the handler can tell the user to answer via
+  buttons; returning False would let the text fall through and be injected
+  into a terminal waiting on a question.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from aiogram.types import Chat, Message, User
 
 from app.bot.router import ExternalQuestionActiveFilter, answer_external_user_question_text
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
+    ExternalTerminalQuestionTarget,
     UserQuestionOption,
     UserQuestionPrompt,
 )
@@ -114,11 +117,12 @@ def _pending(tool_use_id: str = "tuid-1", user_id: int = 1) -> PendingExternalUs
                 options=(UserQuestionOption(label="A"),),
             ),
         ),
-        target=ExternalGhosttyQuestionTarget(
+        target=ExternalTerminalQuestionTarget(
             binding_id="bind-1",
             terminal_id="term-1",
             paired_tty="/dev/ttys005",
             paired_at=datetime(2024, 1, 1, tzinfo=UTC),
+            kind="ghostty",
         ),
     )
 
@@ -146,14 +150,21 @@ async def test_no_match_when_managed_pending_present() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_match_when_ambiguous_multiple_ghostty_questions() -> None:
+async def test_match_when_ambiguous_multiple_ghostty_questions_routes_to_handler() -> None:
+    """Ambiguity must route INTO the handler, not fall through.
+
+    The handler re-resolves and answers "存在多个待处理的外部问题" (see
+    ``test_handler_rejects_when_multiple_ghostty_questions``). If the filter
+    returned False here, the text would fall through to the external-terminal
+    router and be injected into a terminal that is waiting on a question.
+    """
     state = ExternalUserQuestionState(ttl_sec=60)
     state.store(_pending(tool_use_id="tuid-a", user_id=1))
     state.store(_pending(tool_use_id="tuid-b", user_id=1))
     task_service = _FakeTaskService(pending=[])
     filt = ExternalQuestionActiveFilter(state, task_service)  # type: ignore[arg-type]
 
-    assert await filt(_message("some answer", user_id=1)) is False
+    assert await filt(_message("some answer", user_id=1)) is True
 
 
 @pytest.mark.asyncio

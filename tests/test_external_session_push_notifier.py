@@ -276,7 +276,7 @@ class TestNotifyUserQuestion:
         assert result is True
         text = sender.send_message.call_args.kwargs["text"]
         assert "可直接回复文字作为 Other/自由文本" in text
-        assert "请勿在 Ghostty 本地操作" in text
+        assert "请勿在本地终端操作" in text
         keyboard = sender.send_message.call_args.kwargs["keyboard"]
         assert keyboard is not None
         rows = keyboard.rows

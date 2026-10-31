@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from app.domain.external_session_models import ExternalBinding, GhosttyInputTarget
+from app.domain.external_session_models import ExternalBinding, ExternalTerminalTarget
+from app.domain.external_terminal_models import TerminalKind
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,9 @@ def _normalize_to_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def _ghostty_target_to_dict(target: GhosttyInputTarget) -> dict[str, object]:
+def _terminal_target_to_dict(target: ExternalTerminalTarget) -> dict[str, object]:
     data: dict[str, object] = {
+        "kind": target.kind,
         "terminal_id": target.terminal_id,
         "paired_tty": target.paired_tty,
         "paired_at": target.paired_at.isoformat(),
@@ -41,11 +43,13 @@ def _ghostty_target_to_dict(target: GhosttyInputTarget) -> dict[str, object]:
     return data
 
 
-def _ghostty_target_from_dict(raw: object) -> GhosttyInputTarget | None:
-    """Reconstruct a Ghostty target from persisted JSON.
+def _terminal_target_from_dict(raw: object) -> ExternalTerminalTarget | None:
+    """Reconstruct a terminal target from persisted JSON.
 
     Returns ``None`` for missing/malformed data so a corrupt target entry
-    degrades gracefully to "not paired" rather than failing binding load.
+    degrades gracefully to "not paired" rather than failing binding load. A
+    missing ``kind`` means the entry predates kitty support and can only have
+    been a Ghostty surface.
     """
     if not isinstance(raw, dict):
         return None
@@ -57,13 +61,20 @@ def _ghostty_target_from_dict(raw: object) -> GhosttyInputTarget | None:
         isinstance(terminal_id, str) and isinstance(paired_tty, str) and isinstance(binding_id, str) and isinstance(paired_at_raw, str)
     ):
         return None
+    raw_kind = raw.get("kind")
+    kind: TerminalKind = "ghostty"
+    if raw_kind is not None:
+        if raw_kind not in ("ghostty", "kitty"):
+            return None
+        kind = raw_kind
     try:
         paired_at = _normalize_to_utc(datetime.fromisoformat(paired_at_raw))
     except ValueError:
         return None
     name = raw.get("name")
     cwd = raw.get("cwd")
-    return GhosttyInputTarget(
+    return ExternalTerminalTarget(
+        kind=kind,
         terminal_id=terminal_id,
         paired_tty=paired_tty,
         paired_at=paired_at,
@@ -144,18 +155,19 @@ class ExternalBindingStore:
         self._persist()
         return True
 
-    def set_ghostty_target(
+    def set_terminal_target(
         self,
         session_id: str,
         expected_binding_id: str,
         *,
+        kind: TerminalKind,
         terminal_id: str,
         paired_tty: str,
         paired_at: datetime,
         name: str | None = None,
         cwd: str | None = None,
     ) -> bool:
-        """Persist a Ghostty terminal pairing for the bound session.
+        """Persist a terminal pairing (Ghostty surface or kitty window).
 
         Generation-safe: only applies when the binding still exists and its
         ``binding_id`` matches ``expected_binding_id`` (the binding generation
@@ -171,7 +183,8 @@ class ExternalBindingStore:
         binding = self._bindings.get(session_id)
         if binding is None or binding.binding_id != expected_binding_id:
             return False
-        binding.ghostty_target = GhosttyInputTarget(
+        binding.terminal_target = ExternalTerminalTarget(
+            kind=kind,
             terminal_id=terminal_id,
             paired_tty=paired_tty,
             paired_at=paired_at,
@@ -184,12 +197,12 @@ class ExternalBindingStore:
         self._persist()
         return True
 
-    def clear_ghostty_target(
+    def clear_terminal_target(
         self,
         session_id: str,
         expected_binding_id: str,
     ) -> bool:
-        """Remove a Ghostty terminal pairing, generation-safe.
+        """Remove a terminal pairing, generation-safe.
 
         Clears the target only when ``expected_binding_id`` still matches, so a
         stale failure path cannot wipe a target that belongs to a newer binding
@@ -198,9 +211,9 @@ class ExternalBindingStore:
         binding = self._bindings.get(session_id)
         if binding is None or binding.binding_id != expected_binding_id:
             return False
-        if binding.ghostty_target is None:
+        if binding.terminal_target is None:
             return False
-        binding.ghostty_target = None
+        binding.terminal_target = None
         self._persist()
         return True
 
@@ -288,6 +301,10 @@ class ExternalBindingStore:
                 if not binding_id:
                     binding_id = uuid4().hex
                     self._needs_migration_persist = True
+                # Pre-kitty files stored the pairing under ``ghostty_target``.
+                # Rewrite them into the new key/format on the next persist.
+                if "terminal_target" not in entry and entry.get("ghostty_target") is not None:
+                    self._needs_migration_persist = True
                 bindings[session_id] = ExternalBinding(
                     session_id=session_id,
                     user_id=entry["user_id"],
@@ -302,7 +319,9 @@ class ExternalBindingStore:
                     reply_cursor_initialized=bool(entry.get("reply_cursor_initialized", False)),
                     last_activity_at_init=last_activity_at,
                     tty=entry.get("tty"),
-                    ghostty_target=_ghostty_target_from_dict(entry.get("ghostty_target")),
+                    terminal_target=_terminal_target_from_dict(
+                        entry.get("terminal_target") if "terminal_target" in entry else entry.get("ghostty_target")
+                    ),
                 )
             return bindings
         except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
@@ -336,7 +355,7 @@ class ExternalBindingStore:
                 "last_pushed_reply_turn_id": binding.last_pushed_reply_turn_id,
                 "reply_cursor_initialized": binding.reply_cursor_initialized,
                 "tty": binding.tty,
-                "ghostty_target": (_ghostty_target_to_dict(binding.ghostty_target) if binding.ghostty_target is not None else None),
+                "terminal_target": (_terminal_target_to_dict(binding.terminal_target) if binding.terminal_target is not None else None),
             }
         # Atomic write: write to temp file then rename to avoid corruption
         try:

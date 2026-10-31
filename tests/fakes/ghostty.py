@@ -5,22 +5,26 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 
-from app.adapters.process.ghostty_terminal_adapter import GhosttyTerminal, InjectionOutcome
+from app.adapters.process.ghostty_terminal_adapter import ExternalTerminal, TerminalOutcome
+from app.domain.external_terminal_models import TerminalKind
 
 
 class FakeGhosttyTerminalAdapter:
+    kind: TerminalKind = "ghostty"
+
     def __init__(
         self,
         *,
         available: bool = True,
-        terminals: list[GhosttyTerminal] | None = None,
+        terminals: list[ExternalTerminal] | None = None,
     ) -> None:
         self.available = available
         self.terminals = (
             terminals
             if terminals is not None
             else [
-                GhosttyTerminal(
+                ExternalTerminal(
+                    kind="ghostty",
                     terminal_id="term-1",
                     name="claude — project",
                     cwd="/project",
@@ -47,7 +51,7 @@ class FakeGhosttyTerminalAdapter:
     def is_available(self) -> bool:
         return self.available
 
-    async def list_terminals(self) -> tuple[list[GhosttyTerminal] | None, str | None]:
+    async def list_terminals(self) -> tuple[list[ExternalTerminal] | None, str | None]:
         if not self.available:
             return None, "unavailable"
         if self.list_error is not None:
@@ -57,7 +61,7 @@ class FakeGhosttyTerminalAdapter:
     async def validate_terminal(
         self,
         terminal_id: str,
-    ) -> tuple[bool, GhosttyTerminal | None, str | None]:
+    ) -> tuple[bool, ExternalTerminal | None, str | None]:
         self.validate_calls.append(terminal_id)
         if self.validate_entered is not None:
             self.validate_entered.set()
@@ -71,8 +75,8 @@ class FakeGhosttyTerminalAdapter:
         if len(matches) == 1:
             return True, matches[0], None
         if not matches:
-            return False, None, InjectionOutcome.NOT_FOUND
-        return False, None, InjectionOutcome.NOT_UNIQUE
+            return False, None, TerminalOutcome.NOT_FOUND
+        return False, None, TerminalOutcome.NOT_UNIQUE
 
     async def select_user_question_option(
         self,
@@ -141,7 +145,7 @@ class FakeGhosttyTerminalAdapter:
                 self.question_entered.set()
             if self.question_release is not None:
                 await self.question_release.wait()
-            return self.question_outcomes.popleft() if self.question_outcomes else InjectionOutcome.OK
+            return self.question_outcomes.popleft() if self.question_outcomes else TerminalOutcome.OK
         finally:
             self.active_injections -= 1
 
@@ -156,6 +160,6 @@ class FakeGhosttyTerminalAdapter:
                 await self.inject_release.wait()
             if self.inject_error is not None:
                 return self.inject_error
-            return self.inject_outcomes.popleft() if self.inject_outcomes else InjectionOutcome.OK
+            return self.inject_outcomes.popleft() if self.inject_outcomes else TerminalOutcome.OK
         finally:
             self.active_injections -= 1

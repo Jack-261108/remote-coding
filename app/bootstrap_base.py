@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from aiogram import Bot, Dispatcher
 
     from app.adapters.process.ghostty_terminal_adapter import GhosttyTerminalAdapter
+    from app.adapters.process.kitty_terminal_adapter import KittyTerminalAdapter
     from app.bot.adapters.message_sender import AiogramMessageSender
     from app.services.external_binding_store import ExternalBindingStore
     from app.services.external_input_mode_state import ExternalInputTargetStore
@@ -72,6 +73,7 @@ class AppContainerBase:
     external_reply_delivery_pump: ExternalReplyDeliveryPump
     push_notifier: ExternalSessionPushNotifier
     ghostty_adapter: GhosttyTerminalAdapter
+    kitty_adapter: KittyTerminalAdapter
     local_process_probe: LocalProcessProbe
     pairing_callback_registry: PairingCallbackRegistry
     external_input_mode_store: ExternalInputTargetStore

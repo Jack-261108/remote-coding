@@ -14,8 +14,10 @@ class FakeSubprocessProcess:
         self._stderr = stderr
         self.killed = False
         self.waited = False
+        self.stdin_data: bytes | None = None
 
-    async def communicate(self) -> tuple[bytes, bytes]:
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        self.stdin_data = input
         return self._stdout, self._stderr
 
     def kill(self) -> None:

@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.adapters.storage.file_session_store import FileSessionStore
-from app.domain.external_session_models import ExternalBinding, GhosttyInputTarget
+from app.domain.external_session_models import ExternalBinding, ExternalTerminalTarget
+from app.domain.external_terminal_models import TerminalKind
 from app.domain.models import utc_now
 from app.domain.session_models import SessionPhase
 from app.infra.lock_registry import RefCountedLockRegistry
@@ -53,6 +54,9 @@ def build_input_harness(
     paired: bool = True,
     enabled: bool = True,
     adapter: FakeGhosttyTerminalAdapter | None = None,
+    extra_backends: dict[TerminalKind, object] | None = None,
+    paired_kind: TerminalKind = "ghostty",
+    paired_terminal_id: str = "term-1",
     probe: FakeLocalProcessProbe | None = None,
     queue_max_size: int = 5,
     drain_wait: float = 0.05,
@@ -73,8 +77,9 @@ def build_input_harness(
         tty="/dev/ttys005",
     )
     if paired:
-        binding.ghostty_target = GhosttyInputTarget(
-            terminal_id="term-1",
+        binding.terminal_target = ExternalTerminalTarget(
+            kind=paired_kind,
+            terminal_id=paired_terminal_id,
             paired_tty="/dev/ttys005",
             paired_at=utc_now(),
             binding_id=binding.binding_id,
@@ -110,11 +115,14 @@ def build_input_harness(
         notices.append((user_id, text))
         return True
 
+    backends: dict[TerminalKind, object] = {"ghostty": resolved_adapter}
+    backends.update(extra_backends or {})
+
     service = ExternalSessionInputService(
         enabled=enabled,
         binding_store=binding_store,
         session_store=session_store,
-        ghostty_adapter=resolved_adapter,  # type: ignore[arg-type]
+        backends=backends,  # type: ignore[arg-type]
         process_probe=resolved_probe,  # type: ignore[arg-type]
         pairing_registry=pairing,
         input_mode_store=mode_store,

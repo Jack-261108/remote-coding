@@ -24,7 +24,7 @@ async def test_register_reuses_compound_token_and_resolve_is_repeatable() -> Non
         question_index=0,
         action=UserQuestionCallbackAction.TOGGLE,
         option_index=1,
-        origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+        origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
     )
 
     token = await registry.register(**kwargs)
@@ -97,7 +97,7 @@ async def test_ttl_uses_monotonic_clock_without_refreshing_reused_token() -> Non
         question_index=0,
         action=UserQuestionCallbackAction.SELECT,
         option_index=0,
-        origin=UserQuestionCallbackOrigin.EXTERNAL_GHOSTTY,
+        origin=UserQuestionCallbackOrigin.EXTERNAL_TERMINAL,
     )
     token = await registry.register(**kwargs)
     now = 9.0

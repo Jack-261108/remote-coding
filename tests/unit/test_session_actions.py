@@ -12,7 +12,7 @@ from aiogram import Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 
-from app.adapters.process.ghostty_terminal_adapter import GhosttyTerminal
+from app.adapters.process.ghostty_terminal_adapter import ExternalTerminal
 from app.bot.handlers.session_actions import _edit_or_answer, _resolve_terminal_id_prefix, register_session_action_handlers
 from app.domain.external_session_models import ExternalBinding
 from app.domain.hook_models import HookEvent
@@ -705,7 +705,7 @@ class TestBindSuccessPairingPrompt:
                 PairingCandidates(
                     binding_id=binding.binding_id if binding is not None else "bid",
                     paired_tty="/dev/ttyX",
-                    terminals=[GhosttyTerminal(terminal_id="t1", name="Ghostty", cwd="/home/user/proj")],
+                    terminals=[ExternalTerminal(kind="ghostty", terminal_id="t1", name="Ghostty", cwd="/home/user/proj")],
                 ),
             )
         )
@@ -728,7 +728,7 @@ class TestBindSuccessPairingPrompt:
         select_buttons = bind_callback.message.edit_text.call_args.kwargs["reply_markup"].inline_keyboard
         assert select_buttons[0][0].callback_data == f"sess:select:{expected_token}"
 
-        # Step 2: click the sess:select button → should route to NEEDS_PAIRING and render ghpair.
+        # Step 2: click the sess:select button → should route to NEEDS_PAIRING and render tpair.
         select_callback = AsyncMock(spec=CallbackQuery)
         select_callback.data = f"sess:select:{expected_token}"
         select_callback.from_user = MagicMock(spec=User)
@@ -742,7 +742,7 @@ class TestBindSuccessPairingPrompt:
         select_args, select_kwargs = select_callback.message.edit_text.call_args
         rendered_text = select_args[0] if select_args else ""
         assert "选择要配对的 Ghostty 终端" in rendered_text or "终端" in rendered_text
-        assert "ghpair:pairtoken123" in [b.callback_data for row in select_kwargs["reply_markup"].inline_keyboard for b in row]
+        assert "tpair:pairtoken123" in [b.callback_data for row in select_kwargs["reply_markup"].inline_keyboard for b in row]
 
 
 class TestEditOrAnswer:

@@ -38,7 +38,8 @@ import os
 import shutil
 import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
+
+from app.domain.external_terminal_models import ExternalTerminal, TerminalKind, TerminalOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -148,48 +149,11 @@ end run
 """
 
 
-class InjectionOutcome:
-    """Outcomes for ``inject_text``.
-
-    String constants collected in one class so the service can compare against
-    ``InjectionOutcome.*`` names instead of bare literals — keep the string
-    values stable (some persist in logs/state).
-    """
-
-    OK = "ok"
-    NOT_FOUND = "not_found"  # validate_terminal found zero surfaces
-    NOT_UNIQUE = "not_unique"  # AppleScript matched != 1 (shouldn't for a UUID)
-    APPLESCRIPT_DISABLED = "applescript_disabled"  # macOS AppleScript disabled by config
-    GHOSTTY_NOT_RUNNING = "ghostty_not_running"
-    NON_DARWIN = "non_darwin"  # host platform is not macOS
-    OSASCRIPT_MISSING = "osascript_missing"  # osascript binary not on PATH
-    TCC_DENIED = "tcc_denied"
-    TIMEOUT = "timeout"
-    INDETERMINATE = "indeterminate"  # text may be pasted but Enter failed — don't retry
-    OS_ERROR = "os_error"
-
-
-@dataclass(frozen=True, slots=True)
-class GhosttyTerminal:
-    """A Ghostty terminal surface.
-
-    ``terminal_id`` is the stable surface UUID (the only addressing field).
-    ``name``/``cwd`` are display-only snapshots; ``window_index``/``tab_index``
-    identify the surface's location for the pairing UI.
-    """
-
-    terminal_id: str
-    name: str | None
-    cwd: str | None
-    window_index: int | None = None
-    tab_index: int | None = None
-
-
 def _is_darwin(platform: str | None) -> bool:
     return sys.platform == "darwin" if platform is None else platform == "darwin"
 
 
-def _parse_terminals(raw: str) -> list[GhosttyTerminal]:
+def _parse_terminals(raw: str) -> list[ExternalTerminal]:
     """Parse the tab/newline-delimited output of ``_LIST_SCRIPT``.
 
     Each line is ``id\tname\tcwd``; empty lines are skipped. ``name``/``cwd``
@@ -201,7 +165,7 @@ def _parse_terminals(raw: str) -> list[GhosttyTerminal]:
     listing because ``return output`` flattens to a single string with our
     explicit ``\n`` separators.
     """
-    terminals: list[GhosttyTerminal] = []
+    terminals: list[ExternalTerminal] = []
     for line in raw.split("\n"):
         if not line:
             continue
@@ -212,7 +176,8 @@ def _parse_terminals(raw: str) -> list[GhosttyTerminal]:
         name = parts[1] if len(parts) > 1 else None
         cwd = "\t".join(parts[2:]) if len(parts) > 2 else None
         terminals.append(
-            GhosttyTerminal(
+            ExternalTerminal(
+                kind="ghostty",
                 terminal_id=terminal_id,
                 name=name if name != "" else None,
                 cwd=cwd if cwd != "" else None,
@@ -229,7 +194,12 @@ class GhosttyTerminalAdapter:
     then returns a clear unavailable reason instead of attempting subprocess
     calls. This lets the rest of the system keep the binding and reply-push
     features working when input injection is off.
+
+    Implements ``ExternalTerminalBackendProtocol``; see
+    ``docs/specs/2026-10-29-external-kitty-input-design.md``.
     """
+
+    kind: TerminalKind = "ghostty"
 
     def __init__(
         self,
@@ -273,12 +243,12 @@ class GhosttyTerminalAdapter:
 
     def _unavailable_reason(self) -> str:
         if not self._enable_applescript:
-            return InjectionOutcome.APPLESCRIPT_DISABLED
+            return TerminalOutcome.APPLESCRIPT_DISABLED
         if not _is_darwin(self._platform_name):
-            return InjectionOutcome.NON_DARWIN
-        return InjectionOutcome.OSASCRIPT_MISSING
+            return TerminalOutcome.NON_DARWIN
+        return TerminalOutcome.OSASCRIPT_MISSING
 
-    async def list_terminals(self) -> tuple[list[GhosttyTerminal] | None, str | None]:
+    async def list_terminals(self) -> tuple[list[ExternalTerminal] | None, str | None]:
         """Enumerate Ghostty terminals.
 
         Returns ``(terminals, None)`` on success, or ``(None, reason)`` when the
@@ -295,7 +265,7 @@ class GhosttyTerminalAdapter:
         logger.warning("ghostty list_terminals failed: %s", reason, extra={"returncode": returncode})
         return None, reason
 
-    async def validate_terminal(self, terminal_id: str) -> tuple[bool, GhosttyTerminal | None, str | None]:
+    async def validate_terminal(self, terminal_id: str) -> tuple[bool, ExternalTerminal | None, str | None]:
         """Confirm ``terminal_id`` resolves to exactly one live surface.
 
         Implemented by listing all terminals and matching the full UUID in
@@ -308,13 +278,13 @@ class GhosttyTerminalAdapter:
             return False, None, reason
         matches = [t for t in terminals if t.terminal_id == terminal_id]
         if len(matches) != 1:
-            return False, None, InjectionOutcome.NOT_FOUND if not matches else InjectionOutcome.NOT_UNIQUE
+            return False, None, TerminalOutcome.NOT_FOUND if not matches else TerminalOutcome.NOT_UNIQUE
         return True, matches[0], None
 
     async def inject_text(self, terminal_id: str, text: str) -> str:
         """Inject ``text`` + Enter into the terminal with ``terminal_id``.
 
-        Returns an ``InjectionOutcome`` constant. Caller must have already
+        Returns an ``TerminalOutcome`` constant. Caller must have already
         validated the target; this method does not re-list (an inject-call hit
         on a stale UUID yields ``NOT_UNIQUE``/``NOT_FOUND`` from the script,
         classified below). On ``INDETERMINATE`` the caller must NOT retry.
@@ -323,7 +293,7 @@ class GhosttyTerminalAdapter:
             return self._unavailable_reason()
         stdout, stderr, returncode = await self._run_script(_INJECT_SCRIPT, [terminal_id, text])
         if returncode == 0:
-            return InjectionOutcome.OK
+            return TerminalOutcome.OK
         reason = self._classify_inject_failure(stderr or stdout, returncode)
         logger.warning("ghostty inject_text failed: %s", reason, extra={"returncode": returncode})
         return reason
@@ -412,7 +382,7 @@ class GhosttyTerminalAdapter:
             ],
         )
         if returncode == 0:
-            return InjectionOutcome.OK
+            return TerminalOutcome.OK
         reason = self._classify_question_failure(stderr or stdout, returncode)
         logger.warning(
             "ghostty user-question action failed: %s",
@@ -486,34 +456,34 @@ class GhosttyTerminalAdapter:
         """Classify a list_terminals failure text into a stable reason."""
         text = (message or "").lower()
         if "osascript missing" in text:
-            return InjectionOutcome.OS_ERROR
+            return TerminalOutcome.OS_ERROR
         if "not allowed" in text or "automation" in text or "appleevent" in text or "-1743" in text:
-            return InjectionOutcome.TCC_DENIED
+            return TerminalOutcome.TCC_DENIED
         if "can't get application" in text or "no such application" in text or "-1728" in text:
-            return InjectionOutcome.GHOSTTY_NOT_RUNNING
+            return TerminalOutcome.GHOSTTY_NOT_RUNNING
         if "timed out" in text or "timeout" in text or "-1712" in text:
-            return InjectionOutcome.TIMEOUT
+            return TerminalOutcome.TIMEOUT
         if not message:
-            return InjectionOutcome.NOT_FOUND if returncode != 0 else InjectionOutcome.OK
-        return InjectionOutcome.OS_ERROR
+            return TerminalOutcome.NOT_FOUND if returncode != 0 else TerminalOutcome.OK
+        return TerminalOutcome.OS_ERROR
 
     @staticmethod
     def _classify_question_failure(message: str, returncode: int) -> str:
         """Classify a multi-key question action; unknown post-start errors are indeterminate."""
         text = (message or "").lower()
         if "osascript missing" in text:
-            return InjectionOutcome.OS_ERROR
+            return TerminalOutcome.OS_ERROR
         if "can't get application" in text or "no such application" in text or "-1728" in text:
-            return InjectionOutcome.GHOSTTY_NOT_RUNNING
+            return TerminalOutcome.GHOSTTY_NOT_RUNNING
         if "not unique" in text:
-            return InjectionOutcome.NOT_UNIQUE
+            return TerminalOutcome.NOT_UNIQUE
         if "not allowed" in text or "automation" in text or "appleevent" in text or "-1743" in text:
-            return InjectionOutcome.TCC_DENIED
+            return TerminalOutcome.TCC_DENIED
         if "invalid option" in text or "invalid question action" in text:
-            return InjectionOutcome.OS_ERROR
+            return TerminalOutcome.OS_ERROR
         if returncode == -1 or "timed out" in text or "timeout" in text or "-1712" in text:
-            return InjectionOutcome.INDETERMINATE
-        return InjectionOutcome.INDETERMINATE
+            return TerminalOutcome.INDETERMINATE
+        return TerminalOutcome.INDETERMINATE
 
     @staticmethod
     def _classify_inject_failure(message: str, returncode: int) -> str:
@@ -529,22 +499,22 @@ class GhosttyTerminalAdapter:
         # A missing osascript binary is a known availability failure, never
         # indeterminate (the caller would otherwise think the text is pasted).
         if "osascript missing" in text:
-            return InjectionOutcome.OS_ERROR
+            return TerminalOutcome.OS_ERROR
         # Ghostty-down must be checked before the generic "can't get" branch
         # (Can't get application "Ghostty" also contains "can't get").
         if "can't get application" in text or "no such application" in text or "-1728" in text:
-            return InjectionOutcome.GHOSTTY_NOT_RUNNING
+            return TerminalOutcome.GHOSTTY_NOT_RUNNING
         if "not unique" in text:
-            return InjectionOutcome.NOT_UNIQUE
+            return TerminalOutcome.NOT_UNIQUE
         if "can't get" in text:
             # Pre-flight: nothing was pasted.
-            return InjectionOutcome.NOT_FOUND
+            return TerminalOutcome.NOT_FOUND
         if "not allowed" in text or "automation" in text or "appleevent" in text or "-1743" in text:
-            return InjectionOutcome.TCC_DENIED
+            return TerminalOutcome.TCC_DENIED
         if "timed out" in text or "timeout" in text or "-1712" in text:
-            return InjectionOutcome.TIMEOUT
+            return TerminalOutcome.TIMEOUT
         if message:
             # Ambiguous post-paste failure: treat as indeterminate, do not retry.
             logger.info("ghostty inject classified indeterminate: rc=%s msg=%r", returncode, message)
-            return InjectionOutcome.INDETERMINATE
-        return InjectionOutcome.OS_ERROR
+            return TerminalOutcome.INDETERMINATE
+        return TerminalOutcome.OS_ERROR

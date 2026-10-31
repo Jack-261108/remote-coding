@@ -9,9 +9,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
+from app.domain.external_terminal_models import TerminalKind
 from app.domain.models import utc_now
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
+    ExternalTerminalQuestionTarget,
+    ExternalTmuxQuestionTarget,
     ExternalUserQuestionPhase,
     ExternalUserQuestionTarget,
     UserQuestionPrompt,
@@ -21,6 +23,20 @@ logger = logging.getLogger(__name__)
 
 _TTL_SEC = 300.0
 _NON_ACTIVE_GRACE_MULTIPLIER = 5
+
+# Which family of question targets a lookup should match. ``external_terminal``
+# covers every terminal backend (Ghostty and kitty alike) because callers asking
+# "is there a pending external question for this user?" must treat them as one
+# group — otherwise two pending questions on different backends would each look
+# unique and the free-text answer would be routed to one arbitrarily.
+ExternalQuestionTargetGroup = Literal["tmux", "external_terminal"]
+
+
+def _in_group(target: ExternalUserQuestionTarget, group: ExternalQuestionTargetGroup) -> bool:
+    """Whether ``target`` belongs to the queried family of question targets."""
+    if group == "tmux":
+        return isinstance(target, ExternalTmuxQuestionTarget)
+    return isinstance(target, ExternalTerminalQuestionTarget)
 
 
 @dataclass(slots=True)
@@ -137,13 +153,13 @@ class ExternalUserQuestionState:
         self,
         user_id: int,
         *,
-        kind: Literal["tmux", "ghostty"] = "ghostty",
+        group: ExternalQuestionTargetGroup = "external_terminal",
     ) -> ExternalQuestionPendingResolution:
         self._prune_stale()
         matches = [
             PendingExternalUserQuestionSnapshot.from_record(record)
             for record in self._pending.values()
-            if record.user_id == user_id and record.phase is ExternalUserQuestionPhase.ACTIVE and record.target.kind == kind
+            if record.user_id == user_id and record.phase is ExternalUserQuestionPhase.ACTIVE and _in_group(record.target, group)
         ]
         if not matches:
             return ExternalQuestionPendingNone()
@@ -234,27 +250,29 @@ class ExternalUserQuestionState:
             key
             for key, pending in self._pending.items()
             if pending.session_id == session_id
-            and isinstance(pending.target, ExternalGhosttyQuestionTarget)
+            and isinstance(pending.target, ExternalTerminalQuestionTarget)
             and pending.target.binding_id != current_binding_id
         ]
         for key in keys:
             self._pending.pop(key, None)
         return len(keys)
 
-    def invalidate_ghostty_target(
+    def invalidate_terminal_target(
         self,
         *,
         session_id: str,
         binding_id: str,
+        kind: TerminalKind,
         terminal_id: str,
         paired_tty: str,
         paired_at: datetime,
     ) -> int:
-        expected_target = ExternalGhosttyQuestionTarget(
+        expected_target = ExternalTerminalQuestionTarget(
             binding_id=binding_id,
             terminal_id=terminal_id,
             paired_tty=paired_tty,
             paired_at=paired_at,
+            kind=kind,
         )
         keys = [key for key, pending in self._pending.items() if pending.session_id == session_id and pending.target == expected_target]
         for key in keys:

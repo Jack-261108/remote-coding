@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, TypeAlias
 
+from app.domain.external_terminal_models import TerminalKind
+
 
 @dataclass(frozen=True)
 class UserQuestionOption:
@@ -47,15 +49,22 @@ class ExternalTmuxQuestionTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class ExternalGhosttyQuestionTarget:
+class ExternalTerminalQuestionTarget:
+    """An AskUserQuestion bound to one external terminal surface.
+
+    ``kind`` selects which backend performs the key sequence; ``terminal_id``
+    is only unique within that backend. The remaining fields pin the binding
+    generation and PTY so a stale card cannot drive a re-paired terminal.
+    """
+
     binding_id: str
     terminal_id: str
     paired_tty: str
     paired_at: datetime
-    kind: Literal["ghostty"] = "ghostty"
+    kind: TerminalKind
 
 
-ExternalUserQuestionTarget: TypeAlias = ExternalTmuxQuestionTarget | ExternalGhosttyQuestionTarget
+ExternalUserQuestionTarget: TypeAlias = ExternalTmuxQuestionTarget | ExternalTerminalQuestionTarget
 
 
 @dataclass(frozen=True, slots=True)

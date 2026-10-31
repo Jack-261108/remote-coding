@@ -15,13 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from app.adapters.process.ghostty_terminal_adapter import GhosttyTerminal, InjectionOutcome
-from app.domain.external_session_models import ExternalBinding, GhosttyInputTarget
+from app.adapters.process.ghostty_terminal_adapter import ExternalTerminal, TerminalOutcome
+from app.domain.external_session_models import ExternalBinding, ExternalTerminalTarget
 from app.domain.models import utc_now
 from app.domain.session_models import PendingPermission, SessionPhase
 from app.domain.user_question_models import (
-    ExternalGhosttyQuestionTarget,
     ExternalQuestionActionStatus,
+    ExternalTerminalQuestionTarget,
     ExternalUserQuestionContext,
     ExternalUserQuestionPhase,
     UserQuestionOption,
@@ -96,7 +96,7 @@ def _seed_external_question(
     tool_use_id: str = "tool-question",
     multi_select: bool = False,
 ) -> ExternalUserQuestionContext:
-    target = harness.binding.ghostty_target
+    target = harness.binding.terminal_target
     assert target is not None
     prompt = UserQuestionPrompt(
         tool_use_id=tool_use_id,
@@ -126,11 +126,12 @@ def _seed_external_question(
         },
     )
     harness.session_store.save(state)
-    ghostty_target = ExternalGhosttyQuestionTarget(
+    terminal_target = ExternalTerminalQuestionTarget(
         binding_id=target.binding_id,
         terminal_id=target.terminal_id,
         paired_tty=target.paired_tty,
         paired_at=target.paired_at,
+        kind=target.kind,
     )
     harness.external_uq_state.store(
         PendingExternalUserQuestion(
@@ -138,14 +139,14 @@ def _seed_external_question(
             session_id=harness.binding.session_id,
             user_id=harness.binding.user_id,
             prompts=(prompt,),
-            target=ghostty_target,
+            target=terminal_target,
         )
     )
     return ExternalUserQuestionContext(
         tool_use_id=tool_use_id,
         session_id=harness.binding.session_id,
         user_id=harness.binding.user_id,
-        target=ghostty_target,
+        target=terminal_target,
     )
 
 
@@ -187,10 +188,10 @@ async def test_pair_candidates_requires_owner_live_process_and_adapter(make_harn
 async def test_pair_candidates_prioritises_exact_cwd_without_auto_selecting(make_harness) -> None:
     adapter = FakeGhosttyTerminalAdapter(
         terminals=[
-            GhosttyTerminal(terminal_id="other-1", name="Claude Code", cwd="/other"),
-            GhosttyTerminal(terminal_id="match-claude", name="Claude Code", cwd="/project"),
-            GhosttyTerminal(terminal_id="match-shell", name="~/project", cwd="/project"),
-            GhosttyTerminal(terminal_id="other-2", name="shell", cwd="/elsewhere"),
+            ExternalTerminal(kind="ghostty", terminal_id="other-1", name="Claude Code", cwd="/other"),
+            ExternalTerminal(kind="ghostty", terminal_id="match-claude", name="Claude Code", cwd="/project"),
+            ExternalTerminal(kind="ghostty", terminal_id="match-shell", name="~/project", cwd="/project"),
+            ExternalTerminal(kind="ghostty", terminal_id="other-2", name="shell", cwd="/elsewhere"),
         ]
     )
     harness = make_harness(paired=False, adapter=adapter)
@@ -224,6 +225,7 @@ async def test_pair_token_registration_enforces_displayed_binding_generation(mak
         user_id=42,
         session_id="session-1",
         expected_binding_id="old-generation",
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert stale is None
@@ -232,6 +234,7 @@ async def test_pair_token_registration_enforces_displayed_binding_generation(mak
         user_id=42,
         session_id="session-1",
         expected_binding_id=harness.binding.binding_id,
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert token is not None
@@ -243,6 +246,7 @@ async def test_consume_pair_token_persists_snapshot_and_activates(make_harness) 
         user_id=42,
         session_id="session-1",
         expected_binding_id=harness.binding.binding_id,
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert token is not None
@@ -250,10 +254,10 @@ async def test_consume_pair_token_persists_snapshot_and_activates(make_harness) 
     outcome = await harness.service.consume_pair_token(token=token, user_id=42)
     assert outcome is PairOutcome.PAIRED
     binding = harness.binding_store.get_binding("session-1")
-    assert binding is not None and binding.ghostty_target is not None
-    assert binding.ghostty_target.terminal_id == "term-1"
-    assert binding.ghostty_target.name == "claude — project"
-    assert binding.ghostty_target.cwd == "/project"
+    assert binding is not None and binding.terminal_target is not None
+    assert binding.terminal_target.terminal_id == "term-1"
+    assert binding.terminal_target.name == "claude — project"
+    assert binding.terminal_target.cwd == "/project"
     active = await harness.mode_store.get_target(42)
     assert active is not None and active.binding_id == harness.binding.binding_id
 
@@ -264,6 +268,7 @@ async def test_consume_pair_token_refuses_other_user_and_stale_generation(make_h
         user_id=42,
         session_id="session-1",
         expected_binding_id=harness.binding.binding_id,
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert token is not None
@@ -291,10 +296,11 @@ async def test_consume_pair_token_honors_store_generation_safe_setter(make_harne
         user_id=42,
         session_id="session-1",
         expected_binding_id=harness.binding.binding_id,
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert token is not None
-    monkeypatch.setattr(harness.binding_store, "set_ghostty_target", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(harness.binding_store, "set_terminal_target", lambda *_args, **_kwargs: False)
 
     outcome = await harness.service.consume_pair_token(token=token, user_id=42)
     assert outcome is PairOutcome.BINDING_STALE
@@ -307,10 +313,10 @@ async def test_activate_select_validates_persisted_target(make_harness) -> None:
     assert await harness.mode_store.get_target(42) is not None
 
     await harness.service.leave(user_id=42)
-    harness.adapter.validate_error = InjectionOutcome.NOT_FOUND
+    harness.adapter.validate_error = TerminalOutcome.NOT_FOUND
     assert await harness.service.activate_select(user_id=42, session_id="session-1") is PairOutcome.NEEDS_PAIRING
     binding = harness.binding_store.get_binding("session-1")
-    assert binding is not None and binding.ghostty_target is None
+    assert binding is not None and binding.terminal_target is None
 
 
 async def test_repair_same_terminal_invalidates_old_question_generation(make_harness) -> None:
@@ -320,6 +326,7 @@ async def test_repair_same_terminal_invalidates_old_question_generation(make_har
         user_id=42,
         session_id=harness.binding.session_id,
         expected_binding_id=harness.binding.binding_id,
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert token is not None
@@ -329,8 +336,8 @@ async def test_repair_same_terminal_invalidates_old_question_generation(make_har
     assert outcome is PairOutcome.PAIRED
     assert harness.external_uq_state.get(context.tool_use_id) is None
     rebound = harness.binding_store.get_binding(harness.binding.session_id)
-    assert rebound is not None and rebound.ghostty_target is not None
-    assert rebound.ghostty_target.paired_at != context.target.paired_at
+    assert rebound is not None and rebound.terminal_target is not None
+    assert rebound.terminal_target.paired_at != context.target.paired_at
 
 
 # ─── AskUserQuestion transport ---------------------------------------------
@@ -422,9 +429,10 @@ async def test_question_rechecks_target_after_terminal_validation_await(make_har
         )
     )
     await asyncio.wait_for(harness.adapter.validate_entered.wait(), timeout=1)
-    old_target = harness.binding.ghostty_target
+    old_target = harness.binding.terminal_target
     assert old_target is not None
-    harness.binding.ghostty_target = GhosttyInputTarget(
+    harness.binding.terminal_target = ExternalTerminalTarget(
+        kind=old_target.kind,
         terminal_id=old_target.terminal_id,
         paired_tty=old_target.paired_tty,
         paired_at=old_target.paired_at + timedelta(seconds=1),
@@ -443,7 +451,7 @@ async def test_question_rechecks_target_after_terminal_validation_await(make_har
 async def test_question_indeterminate_blocks_retry(make_harness) -> None:
     harness = make_harness(paired=True)
     context = _seed_external_question(harness)
-    harness.adapter.question_outcomes.append(InjectionOutcome.INDETERMINATE)
+    harness.adapter.question_outcomes.append(TerminalOutcome.INDETERMINATE)
 
     first = await harness.service.select_option(
         context=context,
@@ -630,11 +638,11 @@ async def test_missing_terminal_clears_pairing_mode_and_queue(make_harness) -> N
     harness = make_harness(phase=SessionPhase.PROCESSING)
     await _activate(harness)
     assert await harness.service.send_text(user_id=42, text="queued") is SendOutcome.QUEUED
-    harness.adapter.validate_error = InjectionOutcome.NOT_FOUND
+    harness.adapter.validate_error = TerminalOutcome.NOT_FOUND
 
     assert await harness.service.send_text(user_id=42, text="new") is SendOutcome.TERMINAL_INVALID
     binding = harness.binding_store.get_binding("session-1")
-    assert binding is not None and binding.ghostty_target is None
+    assert binding is not None and binding.terminal_target is None
     assert await harness.mode_store.get_target(42) is None
     assert await harness.queue.peek_size("session-1") == 0
 
@@ -646,14 +654,14 @@ async def test_adapter_unavailable_preserves_pairing(make_harness) -> None:
 
     assert await harness.service.send_text(user_id=42, text="hello") is SendOutcome.ADAPTER_UNAVAILABLE
     binding = harness.binding_store.get_binding("session-1")
-    assert binding is not None and binding.ghostty_target is not None
+    assert binding is not None and binding.terminal_target is not None
     assert await harness.mode_store.get_target(42) is not None
 
 
 async def test_indeterminate_injection_is_not_retried(make_harness) -> None:
     harness = make_harness()
     await _activate(harness)
-    harness.adapter.inject_outcomes.append(InjectionOutcome.INDETERMINATE)
+    harness.adapter.inject_outcomes.append(TerminalOutcome.INDETERMINATE)
 
     assert await harness.service.send_text(user_id=42, text="maybe pasted") is SendOutcome.INJECTION_INDETERMINATE
     assert harness.adapter.inject_calls == [("term-1", "maybe pasted")]
@@ -855,7 +863,7 @@ async def test_drain_preflight_failure_restores_head_without_drops(make_harness)
     # ~20x/second, so a preset outcome count only buys wall-clock slack. With
     # a persistent failure the restored head is a steady state — the
     # assertions hold no matter how many retries elapsed.
-    adapter.inject_error = InjectionOutcome.GHOSTTY_NOT_RUNNING
+    adapter.inject_error = TerminalOutcome.GHOSTTY_NOT_RUNNING
     harness = make_harness(phase=SessionPhase.PROCESSING, adapter=adapter)
     await _activate(harness)
     assert await harness.service.send_text(user_id=42, text="hold") is SendOutcome.QUEUED
@@ -876,7 +884,7 @@ async def test_drain_preflight_restore_failure_pauses_remainder(make_harness) ->
     instead of being retried in a backoff-free loop that would emit one notice
     and one subprocess attempt per queued entry."""
     adapter = FakeGhosttyTerminalAdapter()
-    adapter.inject_outcomes.append(InjectionOutcome.GHOSTTY_NOT_RUNNING)
+    adapter.inject_outcomes.append(TerminalOutcome.GHOSTTY_NOT_RUNNING)
     harness = make_harness(
         phase=SessionPhase.PROCESSING,
         adapter=adapter,
@@ -934,7 +942,7 @@ async def test_drop_notice_does_not_report_expired_remainder_as_paused(make_harn
     queued in the very same notice (§9)."""
     clock = {"t": 100.0}
     adapter = FakeGhosttyTerminalAdapter()
-    adapter.inject_outcomes.append(InjectionOutcome.INDETERMINATE)
+    adapter.inject_outcomes.append(TerminalOutcome.INDETERMINATE)
     harness = make_harness(
         phase=SessionPhase.PROCESSING,
         adapter=adapter,
@@ -988,7 +996,7 @@ async def test_send_text_terminal_invalid_clear_reports_dropped_count(make_harne
     await _activate(harness)
     await harness.queue.enqueue("session-1", text="q1", binding_id=harness.binding.binding_id)
 
-    adapter.validate_error = InjectionOutcome.NOT_FOUND
+    adapter.validate_error = TerminalOutcome.NOT_FOUND
     assert await harness.service.send_text(user_id=42, text="late") is SendOutcome.TERMINAL_INVALID
     await _wait_until(lambda: any("配对的终端已失效" in t and "丢弃 1 条" in t for _, t in harness.notices))
 
@@ -1015,7 +1023,7 @@ async def test_drain_indeterminate_drops_only_current_and_pauses_remainder(make_
     next paste would concatenate onto the unsubmitted line — and only a real
     session publish releases it."""
     adapter = FakeGhosttyTerminalAdapter()
-    adapter.inject_outcomes.append(InjectionOutcome.INDETERMINATE)
+    adapter.inject_outcomes.append(TerminalOutcome.INDETERMINATE)
     harness = make_harness(phase=SessionPhase.PROCESSING, adapter=adapter, drain_wait=0.05)
     await _activate(harness)
     assert await harness.service.send_text(user_id=42, text="first") is SendOutcome.QUEUED
@@ -1159,7 +1167,7 @@ async def test_drain_cancellation_does_not_lose_pending_drop_notices(make_harnes
     """A §9 notice still being delivered when the drain task is cancelled must
     survive: delivery runs in its own task, not inside the drain loop."""
     adapter = FakeGhosttyTerminalAdapter()
-    adapter.inject_outcomes.append(InjectionOutcome.INDETERMINATE)
+    adapter.inject_outcomes.append(TerminalOutcome.INDETERMINATE)
     harness = make_harness(phase=SessionPhase.PROCESSING, adapter=adapter)
     await _activate(harness)
     assert await harness.service.send_text(user_id=42, text="one") is SendOutcome.QUEUED
@@ -1210,6 +1218,7 @@ async def test_rebind_aba_clears_old_mode_queue_and_pair_tokens(make_harness) ->
         user_id=42,
         session_id="session-1",
         expected_binding_id=harness.binding.binding_id,
+        terminal_kind="ghostty",
         terminal_id="term-1",
     )
     assert token is not None

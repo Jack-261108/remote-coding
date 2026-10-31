@@ -1,10 +1,11 @@
-"""Short-lived token registry for Ghostty terminal pairing callbacks.
+"""Short-lived token registry for external terminal pairing callbacks.
 
 Telegram callback data has a 64-byte limit and travels through Telegram's
 infra, so we never embed the full ``session_id``, ``binding_id`` and
 ``terminal_id`` UUIDs in callback data. Instead a pairing candidate carries a
 short opaque token (``secrets.token_urlsafe(6)``); the callback resolves the
-token back to the full triple here.
+token back to the full quadruple here (terminal kind included, because a
+Ghostty UUID and a kitty window id live in different id spaces).
 
 The registry enforces the two pairing security invariants from the design
 (``docs/specs/2026-08-03-external-ghostty-input-design.md`` §4 / Security):
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from app.domain.external_terminal_models import TerminalKind
 from app.services.base_callback_registry import BaseCallbackRegistry
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ class PairingTokenRecord:
     user_id: int
     session_id: str
     binding_id: str
+    terminal_kind: TerminalKind
     terminal_id: str
     created_at: datetime
     expires_at: datetime
@@ -62,6 +65,7 @@ class PairingTokenSnapshot:
     user_id: int
     session_id: str
     binding_id: str
+    terminal_kind: TerminalKind
     terminal_id: str
     created_at: datetime
     expires_at: datetime
@@ -74,6 +78,7 @@ class PairingTokenSnapshot:
             user_id=record.user_id,
             session_id=record.session_id,
             binding_id=record.binding_id,
+            terminal_kind=record.terminal_kind,
             terminal_id=record.terminal_id,
             created_at=record.created_at,
             expires_at=record.expires_at,
@@ -110,7 +115,7 @@ class PairConsumeAlreadyConsumed:
 PairConsumeResult = PairConsumeOk | PairConsumeNotFound | PairConsumeUnauthorized | PairConsumeAlreadyConsumed
 
 
-class PairingCallbackRegistry(BaseCallbackRegistry[PairingTokenRecord, PairingTokenStatus, tuple[str, str]]):
+class PairingCallbackRegistry(BaseCallbackRegistry[PairingTokenRecord, PairingTokenStatus, tuple[str, TerminalKind, str]]):
     """In-memory, TTL-bounded pairing token registry.
 
     Construct with ``ttl_sec`` (token lifetime), an optional token factory and
@@ -133,18 +138,21 @@ class PairingCallbackRegistry(BaseCallbackRegistry[PairingTokenRecord, PairingTo
         user_id: int,
         session_id: str,
         binding_id: str,
+        terminal_kind: TerminalKind,
         terminal_id: str,
     ) -> str:
-        """Issue a fresh pairing token for the (user, binding, terminal) triple.
+        """Issue a fresh pairing token for one displayed terminal candidate.
 
-        Any still-pending token for the same ``(session_id, terminal_id)`` is
-        marked INVALIDATED (superseded) so a stale callback button pressed later
-        yields ``PairConsumeNotFound`` instead of pairing to an old candidate
-        snapshot. Returns the new token.
+        Any still-pending token for the same ``(session_id, kind,
+        terminal_id)`` is marked INVALIDATED (superseded) so a stale callback
+        button pressed later yields ``PairConsumeNotFound`` instead of pairing
+        to an old candidate snapshot. The kind is part of the key because
+        terminal ids are only unique within one emulator. Returns the new
+        token.
         """
         async with self._lock:
             self._evict_stale()
-            compound_key = (session_id, terminal_id)
+            compound_key = (session_id, terminal_kind, terminal_id)
             previous_token = self._compound_index.get(compound_key)
             previous = self._records.get(previous_token) if previous_token is not None else None
             if previous is not None and previous.status is PairingTokenStatus.PENDING:
@@ -158,6 +166,7 @@ class PairingCallbackRegistry(BaseCallbackRegistry[PairingTokenRecord, PairingTo
                 user_id=user_id,
                 session_id=session_id,
                 binding_id=binding_id,
+                terminal_kind=terminal_kind,
                 terminal_id=terminal_id,
                 created_at=created_at,
                 expires_at=created_at + timedelta(seconds=self._ttl_sec),

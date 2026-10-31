@@ -14,6 +14,7 @@ from app.adapters.claude.hook_socket_server import HookSocketServer
 from app.adapters.claude.paths import ClaudePaths
 from app.adapters.cli.factory import CLIAdapterFactory
 from app.adapters.process.ghostty_terminal_adapter import GhosttyTerminalAdapter
+from app.adapters.process.kitty_terminal_adapter import KittyTerminalAdapter
 from app.adapters.process.subprocess_runner import SubprocessRunner
 from app.adapters.process.tmux_runner import TmuxRunner
 from app.adapters.storage.file_session_context_store import FileSessionContextStore
@@ -36,6 +37,8 @@ from app.bot.middleware.rate_limit import RateLimitMiddleware
 from app.bot.presenters.permission_message_builder import PermissionMessageBuilder
 from app.bot.router import create_router
 from app.config.settings import Settings
+from app.domain.external_terminal_models import TerminalKind
+from app.domain.protocols import ExternalTerminalBackendProtocol
 from app.domain.session_tombstone import SessionTombstoneStore
 from app.infra.lock_registry import RefCountedLockRegistry
 from app.services.admin_password_service import AdminPasswordService
@@ -368,25 +371,38 @@ class AppContainer(
             interval_sec=settings.session_health_check_interval_sec,
         )
 
-        # External Ghostty session input (design specs/2026-08-03-external-ghostty-input-design.md §4-9).
+        # External terminal session input (design specs/2026-08-03-external-ghostty-input-design.md §4-9,
+        # extended to kitty by specs/2026-10-29-external-kitty-input-design.md).
         # Built unconditionally so enabled=False short-circuits internally and the rest of the
         # binding/permission/reply system keeps working; the service methods are no-ops when off.
         self.ghostty_adapter = GhosttyTerminalAdapter(
             enable_applescript=settings.ghostty_applescript_enabled,
         )
+        self.kitty_adapter = KittyTerminalAdapter(
+            kitten_bin=settings.kitty_bin,
+            listen_on=settings.kitty_listen_on,
+            timeout_sec=settings.kitty_timeout_sec,
+            key_delay_sec=settings.kitty_key_delay_sec,
+            enable_remote_control=settings.kitty_input_enabled,
+        )
+        # The kitty backend is only registered when enabled; a missing backend
+        # makes every kitty-targeted operation fail closed.
+        backends: dict[TerminalKind, ExternalTerminalBackendProtocol] = {"ghostty": self.ghostty_adapter}
+        if settings.kitty_input_enabled:
+            backends["kitty"] = self.kitty_adapter
         self.pairing_callback_registry = PairingCallbackRegistry(
-            ttl_sec=settings.ghostty_pairing_token_ttl_sec,
+            ttl_sec=settings.external_pairing_token_ttl_sec,
         )
         self.external_input_mode_store = ExternalInputTargetStore()
         self.external_input_queue = ExternalInputQueue(
-            max_size=settings.ghostty_input_queue_max_size,
-            ttl_sec=settings.ghostty_input_queue_ttl_sec,
+            max_size=settings.external_input_queue_max_size,
+            ttl_sec=settings.external_input_queue_ttl_sec,
         )
         self.external_session_input_service = ExternalSessionInputService(
-            enabled=settings.ghostty_input_enabled,
+            enabled=settings.external_input_enabled,
             binding_store=self.external_binding_store,
             session_store=self.structured_session_store,
-            ghostty_adapter=self.ghostty_adapter,
+            backends=backends,
             process_probe=self.local_process_probe,
             pairing_registry=self.pairing_callback_registry,
             input_mode_store=self.external_input_mode_store,
@@ -394,7 +410,7 @@ class AppContainer(
             input_locks=self._input_locks,
             external_user_question_state=self.external_uq_state,
             user_question_callback_registry=self.user_question_callback_registry,
-            drain_publish_wait_timeout_sec=settings.ghostty_drain_publish_wait_timeout_sec,
+            drain_publish_wait_timeout_sec=settings.external_drain_publish_wait_timeout_sec,
             # Queue-drop notices (design §9) ride the same push channel.
             notify_user=self.push_notifier.notify_info,
         )

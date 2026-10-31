@@ -15,9 +15,9 @@ import pytest
 
 from app.adapters.process import ghostty_terminal_adapter as gta
 from app.adapters.process.ghostty_terminal_adapter import (
-    GhosttyTerminal,
+    ExternalTerminal,
     GhosttyTerminalAdapter,
-    InjectionOutcome,
+    TerminalOutcome,
 )
 from tests.fakes.subprocess_process import FakeSubprocessProcess
 
@@ -102,10 +102,10 @@ async def test_list_terminals_unavailable_returns_reason(monkeypatch: pytest.Mon
 @pytest.mark.parametrize(
     ("stderr", "expected"),
     [
-        ("not allowed to send Apple events", InjectionOutcome.TCC_DENIED),
-        ("Ghostty got an error: Can't get application", InjectionOutcome.GHOSTTY_NOT_RUNNING),
-        ("timed out", InjectionOutcome.TIMEOUT),
-        ("some osascript error", InjectionOutcome.OS_ERROR),
+        ("not allowed to send Apple events", TerminalOutcome.TCC_DENIED),
+        ("Ghostty got an error: Can't get application", TerminalOutcome.GHOSTTY_NOT_RUNNING),
+        ("timed out", TerminalOutcome.TIMEOUT),
+        ("some osascript error", TerminalOutcome.OS_ERROR),
     ],
 )
 async def test_list_terminals_classifies_failures(
@@ -138,7 +138,7 @@ async def test_validate_terminal_zero_match_is_not_found(monkeypatch: pytest.Mon
     monkeypatch.setattr(gta.sys, "platform", "darwin")
     _patch_exec(monkeypatch, lambda _a: _FakeProc(stdout=b"uuid-A\tt1\t/c\n", returncode=0))
     ok, term, err = await GhosttyTerminalAdapter().validate_terminal("missing")
-    assert not ok and err == InjectionOutcome.NOT_FOUND and term is None
+    assert not ok and err == TerminalOutcome.NOT_FOUND and term is None
 
 
 @pytest.mark.asyncio
@@ -151,7 +151,7 @@ async def test_inject_text_passes_payload_only_via_argv(monkeypatch: pytest.Monk
     calls = _patch_exec(monkeypatch, lambda _a: _FakeProc(returncode=0))
     payload = "hello; rm -rf / && `whoami`"
     outcome = await GhosttyTerminalAdapter().inject_text("uuid-1", payload)
-    assert outcome == InjectionOutcome.OK
+    assert outcome == TerminalOutcome.OK
     args = calls[0]
     assert args[0] == "osascript" and args[1] == "-e"
     assert args[2] == gta._INJECT_SCRIPT, "script source MUST be the constant"
@@ -173,7 +173,7 @@ async def test_inject_text_unicode_payload(monkeypatch: pytest.MonkeyPatch) -> N
     calls = _patch_exec(monkeypatch, lambda _a: _FakeProc(returncode=0))
     payload = "你好\n第二行\twith tab"
     outcome = await GhosttyTerminalAdapter().inject_text("uuid-9", payload)
-    assert outcome == InjectionOutcome.OK
+    assert outcome == TerminalOutcome.OK
     assert calls[0][5] == payload
 
 
@@ -190,7 +190,7 @@ async def test_user_question_select_uses_fixed_script_and_argv(monkeypatch: pyte
         submit_after=True,
     )
 
-    assert outcome == InjectionOutcome.OK
+    assert outcome == TerminalOutcome.OK
     assert calls[0][2] == gta._QUESTION_ACTION_SCRIPT
     assert calls[0][3:] == ["--", "uuid-select", "select", "3", "2", "1", ""]
     assert "uuid-select" not in gta._QUESTION_ACTION_SCRIPT
@@ -217,7 +217,7 @@ async def test_user_question_text_preserves_unicode_and_multiline_in_argv(monkey
         submit_after=False,
     )
 
-    assert outcome == InjectionOutcome.OK
+    assert outcome == TerminalOutcome.OK
     assert calls[0][3:] == ["--", "uuid-text", "answer_text", "2", "-1", "0", answer]
     assert answer not in gta._QUESTION_ACTION_SCRIPT
     input_pos = gta._QUESTION_ACTION_SCRIPT.index("input text answerText")
@@ -237,7 +237,7 @@ async def test_user_question_multi_advance_resets_then_moves_right(monkeypatch: 
         final_question=True,
     )
 
-    assert outcome == InjectionOutcome.OK
+    assert outcome == TerminalOutcome.OK
     assert calls[0][3:] == ["--", "uuid-multi", "advance_multi", "4", "-1", "1", ""]
     reset_pos = gta._QUESTION_ACTION_SCRIPT.index("repeat (optionCount + 1) times")
     right_pos = gta._QUESTION_ACTION_SCRIPT.index('send key "arrowRight"')
@@ -267,7 +267,7 @@ async def test_user_question_timeout_is_indeterminate_and_child_is_reaped(monkey
         submit_after=False,
     )
 
-    assert outcome == InjectionOutcome.INDETERMINATE
+    assert outcome == TerminalOutcome.INDETERMINATE
     assert proc.killed and proc.waited
 
 
@@ -284,7 +284,7 @@ async def test_user_question_unknown_error_is_indeterminate(monkeypatch: pytest.
             option_index=0,
             submit_after=False,
         )
-        == InjectionOutcome.INDETERMINATE
+        == TerminalOutcome.INDETERMINATE
     )
 
 
@@ -308,10 +308,10 @@ async def test_user_question_action_rejects_invalid_arguments(method: str, kwarg
 @pytest.mark.parametrize(
     ("stderr", "expected"),
     [
-        ("terminal not unique", InjectionOutcome.NOT_UNIQUE),
-        ("Can't get terminal", InjectionOutcome.NOT_FOUND),
-        ("not allowed to send Apple events", InjectionOutcome.TCC_DENIED),
-        ('Can\'t get application "Ghostty"', InjectionOutcome.GHOSTTY_NOT_RUNNING),
+        ("terminal not unique", TerminalOutcome.NOT_UNIQUE),
+        ("Can't get terminal", TerminalOutcome.NOT_FOUND),
+        ("not allowed to send Apple events", TerminalOutcome.TCC_DENIED),
+        ('Can\'t get application "Ghostty"', TerminalOutcome.GHOSTTY_NOT_RUNNING),
     ],
 )
 async def test_inject_pre_flight_failures(
@@ -332,7 +332,7 @@ async def test_inject_ambiguous_failure_is_indeterminate_no_retry(monkeypatch: p
     monkeypatch.setattr(gta.shutil, "which", lambda _b: "/usr/bin/osascript")
     monkeypatch.setattr(gta.sys, "platform", "darwin")
     _patch_exec(monkeypatch, lambda _a: _FakeProc(stderr=b"some unexpected applescript error", returncode=1))
-    assert await GhosttyTerminalAdapter().inject_text("uuid-1", "x") == InjectionOutcome.INDETERMINATE
+    assert await GhosttyTerminalAdapter().inject_text("uuid-1", "x") == TerminalOutcome.INDETERMINATE
 
 
 @pytest.mark.asyncio
@@ -359,7 +359,7 @@ async def test_inject_timeout_kills_child(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(gta.asyncio, "create_subprocess_exec", fake)
     adapter = GhosttyTerminalAdapter(timeout_sec=0.01)
-    assert await adapter.inject_text("uuid-1", "x") == InjectionOutcome.TIMEOUT
+    assert await adapter.inject_text("uuid-1", "x") == TerminalOutcome.TIMEOUT
     assert proc.killed, "timeout SHALL kill the osascript child"
     assert proc.waited, "timeout SHALL reap the osascript child"
 
@@ -423,7 +423,7 @@ async def test_kill_abandons_reap_when_child_wedges(monkeypatch: pytest.MonkeyPa
     # the same value, so the wedged wait() is abandoned within ~0.01s.
     adapter = GhosttyTerminalAdapter(timeout_sec=0.01)
     # Must return promptly (not hang); classifies as TIMEOUT.
-    assert await adapter.inject_text("uuid-1", "x") == InjectionOutcome.TIMEOUT
+    assert await adapter.inject_text("uuid-1", "x") == TerminalOutcome.TIMEOUT
     assert proc.killed, "timeout SHALL still SIGKILL the wedged child"
     assert not proc.waited, "wedged child is NOT reaped — _kill abandoned the bounded wait"
 
@@ -440,7 +440,7 @@ async def test_inject_osascript_missing(monkeypatch: pytest.MonkeyPatch) -> None
     # FileNotFoundError from create_subprocess_exec is caught by _run_script,
     # yielding a non-empty stderr so inject classifies os_error / not available.
     outcome = await GhosttyTerminalAdapter().inject_text("uuid-1", "x")
-    assert outcome in {InjectionOutcome.OS_ERROR, "osascript_missing"}
+    assert outcome in {TerminalOutcome.OS_ERROR, "osascript_missing"}
 
 
 def test_parse_terminals_handles_empty_and_partial() -> None:
@@ -453,6 +453,6 @@ def test_parse_terminals_handles_empty_and_partial() -> None:
 def test_ghostty_terminal_is_frozen() -> None:
     import dataclasses
 
-    t = GhosttyTerminal(terminal_id="x", name=None, cwd=None)
+    t = ExternalTerminal(kind="ghostty", terminal_id="x", name=None, cwd=None)
     with pytest.raises(dataclasses.FrozenInstanceError):
         t.terminal_id = "y"  # type: ignore[misc]
